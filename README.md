@@ -1,170 +1,48 @@
-# room-fem — Τεκμηρίωση Κώδικα
+# Room Acoustics FEM Analysis — Project Overview
 
-Αρχείο αναφοράς: `room-fem-config.py`. Αρχείο ρυθμίσεων:
-`room_config.json`.
+## What this project is
 
-Ορισμένες σημειώσεις:
-1. Το βασικό αρχείο είναι το `room-fem-config.py`. Σας έχω ανεβάσει δύο εκδόσεις του κώδικα, μια με την λήψη των δεδομένων από
-αρχείο json και μια χωρίς για την εύκολη ανάγνωση των μεταβλητών και των μεθόδων.
-2. Αν θέλετε να αλλάξετε την αναλυτικότητα του mesh αυτό γίνεται από την αλλαγή της τιμής `elements_per_wavelength` 
-στο αρχείο json. Εγώ έχω ορίσει την τιμή ίση με 10, γνωρίζοντας ότι είναι υπερβολικά αναλυτική.
-3. Για την ταχύτερη περάτωση της προσομοίωσης μπορείτε να αλλάξετε το `nproc=4` στην εντολή `mapdl = launch_mapdl()`
-για την χρήση περισσότερων πυρήνων του επεξεργαστή.
-4. Σε κάθε run καλό θα ήταν να κλείνετε το παράθυρο της mapdl από το task manager.
-5. Αν θέλετε να αλλάξετε τα στοιχεία του δωματίου και να κρατήσετε τις προηγούμενες γραφικές παραστάσεις
-καλό θα ήταν να τις αποθηκεύσετε πρώτα, καθώς γίνεται overwrite.  
----
+A thesis project using finite element (FEM) simulation to analyze the
+acoustic behavior of a room — how sound pressure builds up, resonates,
+and varies throughout the space in response to a noise source, and how
+that response compares against the room's theoretical acoustic
+properties.
 
-## Γεωμετρία: keypoints και επιφάνεια πηγής
+## Motivation
 
-Το δωμάτιο είναι ένα ορθογώνιο κουτί. Η γεωμετρία του κατασκευάζεται από
-8 **keypoints** (ο όρος του APDL για ένα σημείο στον 3D χώρο, `K,id,x,y,z`)
-στις γωνίες του κουτιού, τα οποία συνδέονται σε 6 επίπεδες **επιφάνειες**
-(μία για κάθε τοίχο/δάπεδο/οροφή) με την εντολή `A,...`.
+Real rooms don't respond uniformly to sound at every frequency — they
+have resonances (room modes) where the response is much stronger than
+elsewhere, and nulls where it's much weaker, both determined by the
+room's dimensions and the positions of the source and listener.
 
-Η επιφάνεια της πηγής είναι πιο περίπλοκη, καθώς δεν είναι ένα απλό
-ορθογώνιο — είναι ένας **κυκλικός δίσκος ενσωματωμένος στον μπροστινό
-τοίχο** (το επίπεδο `x = 0`), που αναπαριστά ένα μικρό ηχείο.
+## What the code does
 
-Το APDL δεν διαθέτει μία απευθείας εντολή για "μια κυκλική επιφάνεια σε
-έναν τυχαίο επίπεδο τοίχο". Ο αξιόπιστος τρόπος κατασκευής, ανεξάρτητος
-από τον προσανατολισμό του work plane, είναι ο εξής:
+The main analysis pipeline (`room-fem-mass-source.py`):
 
-1. Τοποθέτηση ενός **κεντρικού keypoint** (`kc`) και **τεσσάρων
-   keypoints περιφέρειας** (`k1`–`k4`), σε απόσταση 90° μεταξύ τους γύρω
-   από τον κύκλο, όλα σε ακτίνα `SRC_R` από το κέντρο, όλα πάνω στο
-   επίπεδο `x = 0`.
-2. Σύνδεση διαδοχικών keypoints περιφέρειας με **τεταρτοκυκλικά τόξα**
-   (`LARC`, από keypoint σε keypoint, διερχόμενα από συγκεκριμένο κέντρο
-   και ακτίνα) — τέσσερα τόξα (`l1`–`l4`), ένα ανά τεταρτημόριο.
-3. Πλήρωση του κλειστού βρόχου των τεσσάρων τόξων σε μία ενιαία
-   **επιφάνεια** (`AL`) — αυτή είναι η `src_area`, η επιφάνεια της
-   πηγής.
+1. **Builds and meshes a rectangular room** in ANSYS Mechanical APDL,
+   using an acoustic finite element formulation.
+2. **Applies a single point noise source**, modeled as an ideal point
+   monopole (a mass-source excitation) — the direct finite element
+   representation of a compact acoustic source.
+3. **Runs a harmonic acoustic solve** across a chosen frequency range,
+   computing the complex sound pressure field throughout the room at
+   each frequency.
+4. **Extracts the sound pressure level (SPL) response at a listener
+   position**, interpolated at the listener's exact coordinates rather
+   than approximated from the nearest mesh node.
+5. **Compares the result against theoretical room modes** — the
+   closed-form rigid-wall resonance frequencies for a room of these
+   dimensions — rather than relying on empirical peak-detection, turning
+   the analysis into a direct validation of the FEM model against known
+   acoustic theory.
+6. **Produces field maps** — 3D and plane cross-section visualizations
+   of the pressure field at the room's strongest resonances — both as
+   static images and as portable data files for interactive exploration.
 
-```python
-kc = mapdl.k(100, 0, SRC_Y, SRC_Z)                  # κέντρο κύκλου
-k1 = mapdl.k(101, 0, SRC_Y + SRC_R, SRC_Z)          # περιφέρεια, +Y
-k2 = mapdl.k(102, 0, SRC_Y, SRC_Z + SRC_R)          # περιφέρεια, +Z
-k3 = mapdl.k(103, 0, SRC_Y - SRC_R, SRC_Z)          # περιφέρεια, -Y
-k4 = mapdl.k(104, 0, SRC_Y, SRC_Z - SRC_R)          # περιφέρεια, -Z
+## Infrastructure
 
-l1 = mapdl.larc(k1, k2, kc, SRC_R)                  # τεταρτοκυκλικό τόξο, τεταρτημόριο 1
-l2 = mapdl.larc(k2, k3, kc, SRC_R)                  # τεταρτημόριο 2
-l3 = mapdl.larc(k3, k4, kc, SRC_R)                  # τεταρτημόριο 3
-l4 = mapdl.larc(k4, k1, kc, SRC_R)                  # τεταρτημόριο 4
-
-src_area = mapdl.al(l1, l2, l3, l4)                 # πλήρωση του βρόχου
-```
-
-### Δημιουργία της οπής
-
-Μόλις υπάρξει η `src_area`, αφαιρείται από τον πλήρη μπροστινό τοίχο:
-
-```python
-front_wall_remainder = mapdl.asba(front_wall, src_area, keep1="", keep2="KEEP")
-```
-
-Η `ASBA` (area subtract area — αφαίρεση επιφάνειας από επιφάνεια)
-αφαιρεί το αποτύπωμα της `src_area` από την `front_wall`. Το
-`keep2="KEEP"` σημαίνει ότι η `src_area` διατηρείται ως ανεξάρτητη
-επιφάνεια αντί να "καταναλωθεί" από τη boolean πράξη — έτσι προκύπτουν
-**δύο** επιφάνειες που μοιράζονται τον κύκλο ως κοινό όριο:
-η `front_wall_remainder` (ο τοίχος, μείον μια κυκλική οπή) και η
-`src_area` (ο δίσκος που τη γεμίζει). Επειδή μοιράζονται ακριβώς αυτό το
-όριο, το πλέγμα που κατασκευάζεται αργότερα πάνω τους είναι αυτόματα
-συμβατό (conformal) στη διεπιφάνεια — δεν απαιτείται χειροκίνητη
-συγκόλληση ή αντιστοίχιση κόμβων.
-
-Στη συνέχεια, η `front_wall_remainder` παίρνει τη θέση της `front_wall`
-παντού όπου χρησιμοποιούνται οι έξι οριακές επιφάνειες του δωματίου (η
-λίστα `wall_areas`, καθώς και ο ορισμός του όγκου `VA`), ενώ η `src_area`
-πλεγματοποιείται και φορτίζεται ξεχωριστά (πυκνότερο πλέγμα, οριακή
-συνθήκη ταχύτητας) από τον υπόλοιπο τοίχο.
-
----
-
-## Η μονοπολική πηγή και η έξοδός της
-
-Η πηγή σε αυτό το μοντέλο δεν είναι ένας πραγματικός, φυσικά κινούμενος
-κώνος ηχείου — είναι μια μικρή κυκλική επιφάνεια (η `src_area`) στην
-οποία επιβάλλεται απευθείας μια **σταθερή κάθετη ταχύτητα** μέσω της
-οριακής συνθήκης `SHLD`
-(`mapdl.sf("all", "SHLD", SRC_VELOCITY)`). Η ίδια τιμή ταχύτητας
-χρησιμοποιείται σε **όλες** τις συχνότητες της σάρωσης — δεν υπάρχει
-καμία δύναμη, μάζα ή δυσκαμψία πίσω από αυτή την κίνηση.
-
----
-
-## Αναφορά συναρτήσεων
-
-### `lap(label)`
-Βοηθητική συνάρτηση χρονομέτρησης. Τυπώνει τον χρόνο που πέρασε από την
-προηγούμενη κλήση της `lap()`, καθώς και το συνολικό χρόνο από την
-εκκίνηση του script. Καλείται μετά από κάθε βασικό στάδιο (γεωμετρία,
-πλέγμα, επίλυση, sweep, γραφήματα), ώστε να φαίνεται πού καταναλώνεται
-πραγματικά ο χρόνος σε μια εκτέλεση.
-
-### `rigid_room_modes(lx, ly, lz, c, fmin, fmax, nmax=8)`
-Υπολογίζει τις θεωρητικές συχνότητες συντονισμού του δωματίου από τον
-κλασικό κλειστού τύπου τύπο για δωμάτιο με άκαμπτους τοίχους, για κάθε
-συνδυασμό δεικτών ιδιομορφής `(nx, ny, nz)` έως το `nmax` σε κάθε
-διεύθυνση, περιορισμένο στο εύρος σάρωσης `[fmin, fmax]`. Το αποτέλεσμά της χρησιμοποιείται για τη σχεδίαση
-των διακεκομμένων γραμμών αναφοράς στο γράφημα SPL του ακροατή, ώστε να
-επιβεβαιώνεται οπτικά ότι οι κορυφές του FEM βρίσκονται εκεί όπου
-προβλέπει η θεωρία.
-
-### `nodal_pressure(target_freq)`
-Εξάγει τη **μιγαδική** πίεση (πραγματικό + φανταστικό μέρος) σε **κάθε
-κόμβο του πλέγματος**, στην πλησιέστερη επιλυμένη συχνότητα προς το
-`target_freq`. Χρησιμοποιείται για τα τρισδιάστατα γραφήματα και τα
-γραφήματα επιπέδου, όπου απαιτείται το πλήρες χωρικό πεδίο. Διαβάζει το
-πραγματικό (`KIMG=0`) και το φανταστικό (`KIMG=1`) μέρος ξεχωριστά μέσω
-`*VGET` και τα συνδυάζει — παραμένει μιγαδική (δεν ανάγεται σε μέτρο εδώ)
-ώστε η εξαγωγή να παραμένει επαναχρησιμοποιήσιμη για οτιδήποτε χρειάζεται
-τη φάση, όχι μόνο για γραφήματα βασισμένα στο μέτρο.
-
-### `match_order(target_ids, source_ids, values)`
-Αναδιατάσσει τα `values` (τα οποία βρίσκονται προς το παρόν στη σειρά των
-`source_ids`) ώστε να αντιστοιχούν στη σειρά των `target_ids`. Είναι
-απαραίτητη επειδή η σειρά κόμβων της `nodal_pressure()` (από ζωντανή
-ανάγνωση της βάσης δεδομένων μέσω `*VGET`) και η σειρά κόμβων του
-`mapdl.mesh.nnum` (από το προσωρινά αποθηκευμένο αντικείμενο πλέγματος)
-προέρχονται από δύο διαφορετικές εσωτερικές διαδρομές δεδομένων, χωρίς
-καμία εγγύηση ότι συμφωνούν. Αν παραλειφθεί αυτό το βήμα, θα μπορούσε να
-αποδοθεί σιωπηλά η τιμή πίεσης ενός κόμβου στη θέση ενός εντελώς
-διαφορετικού κόμβου στο γράφημα, χωρίς να εμφανιστεί κανένα σφάλμα.
-
-### `to_db(pa)`
-Μετατρέπει ένα πλάτος πίεσης σε Pascal σε dB SPL ως προς την καθιερωμένη
-τιμή αναφοράς 20 µPa: `20 · log10(|p| / 20e-6)`. Χρησιμοποιείται παντού
-όπου μια ακατέργαστη τιμή πίεσης πρέπει να μετατραπεί σε τιμή decibel για
-γράφημα.
-
-### `listener_sweep(node, n_sets)`
-Επιστρέφει το **πλάτος** της πίεσης (όχι μιγαδικό — μόνο μέτρο) σε έναν
-κόμβο, σε όλες τις επιλυμένες συχνότητες της σάρωσης. Διαβάζει απευθείας
-το `KIMG=3` (`AMPL`), καθώς το sweep SPL δεν χρειάζεται ποτέ τη φάση.
-Ολόκληρος ο βρόχος ανά συχνότητα ουρώνεται μέσω του `mapdl.non_interactive`
-και αποστέλλεται στο MAPDL ως μία δέσμη (batch), αντί για μία μετάβαση
-(round trip) ανά συχνότητα — αυτό είναι που διατηρεί γρήγορη τη σάρωση
-των ~130 συχνοτήτων.
-
-### `plot_3d(f, field, tag)`
-Σχεδιάζει το πλήρες τρισδιάστατο πλέγμα, χρωματισμένο ανά SPL, στη
-συχνότητα `f`. Το `tag` είναι `"peak"` ή `"dip"`, και χρησιμοποιείται
-στον τίτλο του γραφήματος και στο όνομα του αρχείου εξόδου. Επειδή το
-πλέγμα είναι ένας συμπαγής, μη τμημένος όγκος, από έξω είναι ορατή μόνο η
-**εξωτερική επιφάνειά** του (οι τοίχοι) — το πεδίο χρώματος περιλαμβάνει
-τεχνικά και τις τιμές των εσωτερικών κόμβων, όμως αυτές παραμένουν
-καλυμμένες. Ανοίγει πρώτα ένα διαδραστικό παράθυρο, και στη συνέχεια
-σχεδιάζει ξανά την ίδια όψη χωρίς γραφικό περιβάλλον (headless) για να
-αποθηκεύσει ένα PNG στον φάκελο `plots/3d_pressure/`.
-
-### `plot_plane(f, field, plane_z, tag)`
-Εξάγει μια λεπτή οριζόντια τομή του πλέγματος στο ύψος `plane_z` (κόμβοι
-εντός 5 cm από αυτό το ύψος) και τη σχεδιάζει ως δισδιάστατο γράφημα
-πληρωμένων ισοϋψών (contour plot). Εδώ είναι το μόνο σημείο όπου η
-εσωτερική χωρική λεπτομέρεια είναι πραγματικά ορατή, καθώς δεν
-αποκρύπτεται από εξωτερικό κέλυφος όπως στο τρισδιάστατο γράφημα.
-Αποθηκεύεται απευθείας στον φάκελο `plots/3d_plane/` (χωρίς διαδραστικό
-παράθυρο, μόνο ως γράφημα matplotlib).
+The simulation runs on **ANSYS MAPDL**, driven via **PyMAPDL**, submitted
+as batch jobs through **Slurm** on AUTh's Aristotle HPC cluster — needed
+because an accurate room-scale acoustic mesh, solved across a useful
+frequency range, is too computationally demanding for a personal
+machine.
