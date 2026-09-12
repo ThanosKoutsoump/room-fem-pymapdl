@@ -52,11 +52,11 @@ LX = _cfg["room"]["length_x_m"]
 LY = _cfg["room"]["length_y_m"]
 LZ = _cfg["room"]["height_z_m"]
 
+# source is a point excitation
 SRC_X = _cfg["source"]["x_m"]
 SRC_Y = _cfg["source"]["y_m"]
 SRC_Z = _cfg["source"]["z_m"]
 SRC_MASS_MAGNITUDE = _cfg["source"]["mass_source_kg_s"]
-
 
 LISTENER_XYZ = (_cfg["listener"]["x_m"], _cfg["listener"]["y_m"],
                 _cfg["listener"]["z_m"])
@@ -194,7 +194,7 @@ solved_freqs = np.unique(mapdl.post_processing.time_values)
 # ==== POST-PROCESSING HELPERS ================================================
 
 def nodal_pressure(target_freq):
-
+    """Full-mesh complex pressure at the nearest solved frequency."""
     f = solved_freqs[np.argmin(np.abs(solved_freqs - target_freq))]
     mapdl.set(time=f, kimg=0)
     real = mapdl.get_array(entity="NODE", item1="PRES")
@@ -208,24 +208,51 @@ def to_db(pa):
 
 
 def listener_sweep(xyz, n_sets):
-    
+    """Extract complex pressure and velocity at a listener point for all solved frequencies."""
     probe = pv.PolyData(np.array([xyz]))
     grid = mapdl.mesh.grid.copy()
 
-    amps = np.zeros(n_sets)
+    pres = np.zeros(n_sets, dtype=complex)
+    vel = np.zeros((n_sets, 3), dtype=complex)
     for i in range(1, n_sets + 1):
-        mapdl.set(lstep=1, sbstep=i, kimg=3)
-        grid.point_data["PRES_AMP"] = mapdl.get_array(entity="NODE", item1="PRES")
+        omega = 2 * np.pi * solved_freqs[i - 1]
+
+        mapdl.set(lstep=1, sbstep=i, kimg=0)
+        grid.point_data["P_RE"] = mapdl.get_array(entity="NODE", item1="PRES")
+        mapdl.set(lstep=1, sbstep=i, kimg=1)
+        grid.point_data["P_IM"] = mapdl.get_array(entity="NODE", item1="PRES")
+
+        grad_re = grid.compute_derivative(scalars="P_RE")["gradient"]
+        grad_im = grid.compute_derivative(scalars="P_IM")["gradient"]
+        grid.point_data["GX_RE"], grid.point_data["GY_RE"], grid.point_data["GZ_RE"] = \
+            grad_re[:, 0], grad_re[:, 1], grad_re[:, 2]
+        grid.point_data["GX_IM"], grid.point_data["GY_IM"], grid.point_data["GZ_IM"] = \
+            grad_im[:, 0], grad_im[:, 1], grad_im[:, 2]
+
         sampled = probe.sample(grid)
-        amps[i - 1] = sampled["PRES_AMP"][0]
-    return amps
+        pres[i - 1] = sampled["P_RE"][0] + 1j * sampled["P_IM"][0]
+        grad_p = np.array([
+            sampled["GX_RE"][0] + 1j * sampled["GX_IM"][0],
+            sampled["GY_RE"][0] + 1j * sampled["GY_IM"][0],
+            sampled["GZ_RE"][0] + 1j * sampled["GZ_IM"][0],
+        ])
+        vel[i - 1] = 1j * grad_p / (omega * RHO_AIR)
+
+    return pres, vel
 
 
 # ==== LISTENER SWEEP =========================================================
 
 freqs = solved_freqs
-listener_pressure = listener_sweep(LISTENER_XYZ, len(freqs))
+listener_pressure, listener_velocity = listener_sweep(LISTENER_XYZ, len(freqs))
 listener_spl = to_db(listener_pressure)
+
+# Time-averaged acoustic intensity vector
+
+listener_intensity = 0.5 * np.real(
+    listener_pressure[:, None] * np.conj(listener_velocity))
+listener_intensity_mag = np.linalg.norm(listener_intensity, axis=1)
+listener_velocity_mag = np.linalg.norm(np.abs(listener_velocity), axis=1)
 lap("listener sweep")
 
 
@@ -249,7 +276,31 @@ ax.set_title("Listener SPL response")
 ax.grid(True, alpha=0.3)
 fig.tight_layout()
 fig.savefig(os.path.join(OUTPUT_DIR, "listener_sweep.png"), dpi=150)
+plt.close(fig)
 lap("listener sweep plot")
+
+# ==== LISTENER VELOCITY / INTENSITY PLOTS ====================================
+
+fig, ax = plt.subplots(figsize=(7.5, 4.5))
+ax.plot(freqs, listener_velocity_mag, color="tab:blue")
+ax.set_xlabel("Frequency (Hz)")
+ax.set_ylabel("Particle velocity magnitude (m/s)")
+ax.set_title("Listener particle velocity response")
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+fig.savefig(os.path.join(OUTPUT_DIR, "listener_velocity.png"), dpi=150)
+plt.close(fig)
+
+fig, ax = plt.subplots(figsize=(7.5, 4.5))
+ax.plot(freqs, listener_intensity_mag, color="tab:green")
+ax.set_xlabel("Frequency (Hz)")
+ax.set_ylabel("Sound intensity magnitude (W/m^2)")
+ax.set_title("Listener sound intensity response")
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+fig.savefig(os.path.join(OUTPUT_DIR, "listener_intensity.png"), dpi=150)
+plt.close(fig)
+lap("listener velocity/intensity plots")
 
 # ==== RESONANCE FIELD MAPS ===================================================
 
@@ -272,7 +323,7 @@ def plot_3d(f, field, tag, vmin, vmax):
 def plot_plane(f, field, plane_z, tag, vmin, vmax):
     grid = mapdl.mesh.grid.copy()
     grid.point_data["SPL (dB)"] = to_db(field)
-
+    
     plane_slice = grid.slice(normal="z", origin=(0, 0, plane_z + 1e-4))
     pts = plane_slice.points
     spl = np.clip(plane_slice.point_data["SPL (dB)"], vmin, vmax)
@@ -288,6 +339,7 @@ def plot_plane(f, field, plane_z, tag, vmin, vmax):
     fig.tight_layout()
     fig.savefig(os.path.join(
         DIR_3D_PLANE, f"spl_plane_{f:.0f}Hz_z{plane_z:.2f}m_{tag}.png"), dpi=150)
+    plt.close(fig)
 
 
 mapdl.allsel()
