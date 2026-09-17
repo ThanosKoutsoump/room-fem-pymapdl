@@ -1,37 +1,35 @@
 {
   "room": {
-    "length_x_m": 8.0,
-    "length_y_m": 5.0,
-    "height_z_m": 3.2
+    "length_x_m": 4.0,
+    "length_y_m": 3.5,
+    "height_z_m": 2.8
   },
   "source": {
     "x_m": 0.5,
     "y_m": 0.5,
-    "z_m": 1.2,
+    "z_m": 0.5,
     "mass_source_kg_s": 0.0089
   },
   "listener": {
-    "x_m": 4.0,
-    "y_m": 2.5,
-    "z_m": 1.2
+    "x_m": 3.5,
+    "y_m": 3.0,
+    "z_m": 2.3
   },
   "acoustics": {
     "speed_of_sound_m_s": 343.0,
     "air_density_kg_m3": 1.21,
-    "wall_absorption_coefficient": 0.1
+    "wall_absorption_coefficient": 0.05
   },
   "analysis": {
     "freq_min_hz": 20,
     "freq_max_hz": 150,
     "num_substeps": 260,
-    "elements_per_wavelength": 6
+    "elements_per_wavelength": 8
   },
   "plotting": {
     "plane_heights_z_m": [
-      0.3,
       1.2,
-      2.4
-    ],
-    "num_peaks": 6
+      2.3
+    ]
   }
 }
