@@ -6,6 +6,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import pyvista as pv
+from scipy.interpolate import griddata
 
 pv.OFF_SCREEN = True
 
@@ -13,14 +14,20 @@ from ansys.mapdl.core import launch_mapdl
 
 # ==== OUTPUT FOLDERS ========================================================
 
-OUTPUT_DIR = "plots"
+_job_id = os.environ.get("SLURM_JOB_ID", "local")
+
+OUTPUT_DIR = f"plots_{_job_id}"
 DIR_3D_PRESSURE = os.path.join(OUTPUT_DIR, "3d_pressure")
 DIR_3D_PLANE = os.path.join(OUTPUT_DIR, "3d_plane")
 DIR_3D_DATA = os.path.join(OUTPUT_DIR, "3d_data")
+DIR_MODEL = os.path.join(OUTPUT_DIR, "model")
 
 os.makedirs(DIR_3D_PRESSURE, exist_ok=True)
 os.makedirs(DIR_3D_PLANE, exist_ok=True)
 os.makedirs(DIR_3D_DATA, exist_ok=True)
+os.makedirs(DIR_MODEL, exist_ok=True)
+
+JOBNAME = "room_acoustics"     # used for the .db export
 
 # ==== TIMER ================================================================
 
@@ -60,9 +67,11 @@ SRC_MASS_MAGNITUDE = _cfg["source"]["mass_source_kg_s"]
 
 LISTENER_XYZ = (_cfg["listener"]["x_m"], _cfg["listener"]["y_m"],
                 _cfg["listener"]["z_m"])
+LISTENER_X, LISTENER_Y, LISTENER_Z = LISTENER_XYZ
 
 C0 = _cfg["acoustics"]["speed_of_sound_m_s"]
 RHO_AIR = _cfg["acoustics"]["air_density_kg_m3"]
+
 ALPHA_WALL = _cfg["acoustics"]["wall_absorption_coefficient"]
 
 FREQ_MIN = _cfg["analysis"]["freq_min_hz"]
@@ -71,18 +80,17 @@ N_SUBSTEPS = _cfg["analysis"]["num_substeps"]
 ELEMS_PER_WAVELENGTH = _cfg["analysis"]["elements_per_wavelength"]
 
 PLANE_HEIGHTS_Z = _cfg["plotting"]["plane_heights_z_m"]
-NUM_PEAKS = _cfg["plotting"]["num_peaks"]
 
-
+# Wavelength-based target element size.
 ESIZE = C0 / (FREQ_MAX * ELEMS_PER_WAVELENGTH)
-_r = np.sqrt(1.0 - ALPHA_WALL)
-Z_WALL = RHO_AIR * C0 * (1.0 + _r) / (1.0 - _r)   # wall impedance (Pa*s/m)
-P_REF = 20e-6                       # 0 dB SPL reference pressure (Pa)
+SMART_SIZE = 9
+HP_ELEM_SIZE = ESIZE / 4    # target edge length right at the hard point
+P_REF = 20e-6               # 0 dB SPL reference pressure (Pa)
 
 
 def rigid_room_modes(lx, ly, lz, c, fmin, fmax, nmax=8):
     """Closed-form rigid-wall eigenfrequencies -- the theoretical modes to
-    check the real (absorptive) room's response against."""
+    check the real room's response against."""
     modes = []
     for nx in range(nmax + 1):
         for ny in range(nmax + 1):
@@ -98,7 +106,6 @@ def rigid_room_modes(lx, ly, lz, c, fmin, fmax, nmax=8):
 
 # ==== ROOM GEOMETRY ==========================================================
 
-_job_id = os.environ.get("SLURM_JOB_ID", "local")
 _run_base = os.environ.get("MAPDL_RUN_BASE", os.getcwd())
 _mapdl_log_dir = os.path.join(_run_base, "mapdl_run", f"job_{_job_id}")
 os.makedirs(_mapdl_log_dir, exist_ok=True)
@@ -136,40 +143,216 @@ right_wall = mapdl.a(4, 3, 7, 8)
 wall_areas = [front_wall, back_wall, floor, ceiling, left_wall, right_wall]
 room_vol = mapdl.va(front_wall, back_wall, floor, ceiling, left_wall, right_wall)
 
-# For local mesh refinement
-src_kp = mapdl.k(100, SRC_X, SRC_Y, SRC_Z)
+# Geometric slices at source, listener, and every plotting height
+
+SLICE_TOL = 1e-6
+_raw_heights = [SRC_Z, LISTENER_Z] + list(PLANE_HEIGHTS_Z)
+_interior_heights = [z for z in _raw_heights if SLICE_TOL < z < LZ - SLICE_TOL]
+slice_heights = []
+for z in sorted(_interior_heights):
+    if not slice_heights or abs(z - slice_heights[-1]) > SLICE_TOL:
+        slice_heights.append(z)
+print(f"[geometry] slicing the room at z = {slice_heights} m "
+      f"(source + listener hard points + plotting planes)")
+
+_wp_z = 0.0
+for z in slice_heights:
+    mapdl.allsel()
+    mapdl.wpoffs(0, 0, z - _wp_z)
+    mapdl.vsbw("ALL", "", "DELETE")
+    _wp_z = z
+mapdl.wpoffs(0, 0, -_wp_z)   # restore the working plane to the global origin
+mapdl.allsel()
+
+
+mapdl.vglue("ALL")
+mapdl.allsel()
+n_vols = int(mapdl.get_value(entity="volu", entnum=0, item1="count"))
+print(f"[geometry] {n_vols} volume(s) after slicing at {slice_heights} m "
+      f"(expected {len(slice_heights) + 1})")
+if n_vols != len(slice_heights) + 1:
+    raise RuntimeError(
+        f"expected {len(slice_heights) + 1} volumes after slicing at "
+        f"{slice_heights} m, found {n_vols} -- one or more of the "
+        "requested slice heights likely didn't produce a real cut; check "
+        "each height individually with ASEL,S,LOC,Z,<height> in APDL.")
+
+mapdl.asel("S", "LOC", "Z", SRC_Z)
+n_slice_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
+
+print(f"[geometry] found {n_slice_areas} slice area(s) at z={SRC_Z} m")
+if n_slice_areas != 1:
+    raise RuntimeError(
+        f"expected exactly 1 interior area at z=SRC_Z ({SRC_Z} m), found "
+        f"{n_slice_areas} -- the slicing may not have produced the "
+        "expected geometry; check PLANE_HEIGHTS_Z and SRC_Z for "
+        "near-duplicate heights.")
+
+slice_area = int(mapdl.get_value(entity="area", entnum=0, item1="num", it1num="max"))
+mapdl.hptcreate("AREA", slice_area, "", "COORD", SRC_X, SRC_Y, SRC_Z)
+src_kp = int(mapdl.get_value(entity="kp", entnum=0, item1="num", it1num="max"))
+
+# Confirm the hard point landed exactly on the slice plane
+
+hp_x = mapdl.get_value(entity="kp", entnum=src_kp, item1="loc", it1num="x")
+hp_y = mapdl.get_value(entity="kp", entnum=src_kp, item1="loc", it1num="y")
+hp_z = mapdl.get_value(entity="kp", entnum=src_kp, item1="loc", it1num="z")
+if abs(hp_z - SRC_Z) > 1e-9 or abs(hp_x - SRC_X) > 1e-9 or abs(hp_y - SRC_Y) > 1e-9:
+    raise RuntimeError(
+        f"hard point KP={src_kp} is at ({hp_x}, {hp_y}, {hp_z}) m, not "
+        f"({SRC_X}, {SRC_Y}, {SRC_Z}) m -- it did not land on the slice.")
+print(f"[geometry] hard point KP={src_kp} confirmed at "
+      f"({hp_x:.4f}, {hp_y:.4f}, {hp_z:.4f}) m, on the z={SRC_Z} m slice")
+
+
+mapdl.allsel()
+mapdl.asel("S", "LOC", "Z", LISTENER_Z)
+n_listener_slice_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
+print(f"[geometry] found {n_listener_slice_areas} slice area(s) at "
+      f"z={LISTENER_Z} m (listener plane)")
+if n_listener_slice_areas != 1:
+    raise RuntimeError(
+        f"expected exactly 1 interior area at z=LISTENER_Z ({LISTENER_Z} "
+        f"m), found {n_listener_slice_areas} -- check PLANE_HEIGHTS_Z, "
+        "SRC_Z, and LISTENER_Z for near-duplicate heights.")
+
+
+listener_slice_area = int(mapdl.get_value(entity="area", entnum=0, item1="num", it1num="max"))
+mapdl.hptcreate("AREA", listener_slice_area, "", "COORD",
+                LISTENER_X, LISTENER_Y, LISTENER_Z)
+listener_kp = int(mapdl.get_value(entity="kp", entnum=0, item1="num", it1num="max"))
+
+lhp_x = mapdl.get_value(entity="kp", entnum=listener_kp, item1="loc", it1num="x")
+lhp_y = mapdl.get_value(entity="kp", entnum=listener_kp, item1="loc", it1num="y")
+lhp_z = mapdl.get_value(entity="kp", entnum=listener_kp, item1="loc", it1num="z")
+if (abs(lhp_z - LISTENER_Z) > 1e-9 or abs(lhp_x - LISTENER_X) > 1e-9
+        or abs(lhp_y - LISTENER_Y) > 1e-9):
+    raise RuntimeError(
+        f"listener hard point KP={listener_kp} is at ({lhp_x}, {lhp_y}, "
+        f"{lhp_z}) m, not ({LISTENER_X}, {LISTENER_Y}, {LISTENER_Z}) m "
+        "-- it did not land on the slice.")
+print(f"[geometry] listener hard point KP={listener_kp} confirmed at "
+      f"({lhp_x:.4f}, {lhp_y:.4f}, {lhp_z:.4f}) m, on the "
+      f"z={LISTENER_Z} m slice")
+
+mapdl.allsel()
 
 lap("geometry")
 
 # ==== MESH ===================================================================
 
-mapdl.type(1)
-mapdl.mat(1)
 mapdl.mshape(1, "3D")
 mapdl.mshkey(0)
-mapdl.kesize(src_kp, 0.03)   # finer mesh right at the source point
-mapdl.esize(ESIZE)
-mapdl.vmesh(room_vol)
-print(f"[mesh] {mapdl.mesh.n_elem} elements, {mapdl.mesh.n_node} nodes, "
-      f"esize={ESIZE:.3f} m")
 
-# Portable mesh geometry export for local interactivity in PyVista/ParaView.
+mapdl.esize(ESIZE)  
+mapdl.smrtsize(SMART_SIZE) 
+
+mapdl.kesize(src_kp, HP_ELEM_SIZE)
+mapdl.kesize(listener_kp, HP_ELEM_SIZE)
+
+mapdl.allsel()
+
+mapdl.type(1)
+mapdl.mat(1)
+mapdl.vmesh("all")
+
+print(f"[mesh] {mapdl.mesh.n_elem} elements, {mapdl.mesh.n_node} nodes ")
+
+# Mesh for ParaView.
 mesh_grid = mapdl.mesh.grid.copy()
 mesh_grid.save(os.path.join(DIR_3D_DATA, "mesh.vtu"))
 
 lap("mesh")
 
+# ==== WALL ABSORPTION ========================================================
+
+mapdl.allsel()
+if ALPHA_WALL > 0:
+    mapdl.asel("S", "LOC", "X", 0)
+    mapdl.asel("A", "LOC", "X", LX)
+    mapdl.asel("A", "LOC", "Y", 0)
+    mapdl.asel("A", "LOC", "Y", LY)
+    mapdl.asel("A", "LOC", "Z", 0)
+    mapdl.asel("A", "LOC", "Z", LZ)
+    n_wall_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
+    print(f"[bc] {n_wall_areas} exterior wall area(s) selected for "
+          f"absorption (alpha={ALPHA_WALL})")
+    if n_wall_areas == 0:
+        raise RuntimeError(
+            "no exterior wall areas found at the 6 bounding planes -- "
+            "wall absorption BC was not applied.")
+
+    mapdl.nsla("S", 1)   # nkey=1: include nodes shared with unselected
+                         # areas/edges (wall corners, edges shared with
+                         # interior slice planes)
+    n_wall_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
+    mapdl.sf("ALL", "ATTN", ALPHA_WALL)
+    print(f"[bc] absorption coefficient alpha={ALPHA_WALL} applied to "
+          f"{n_wall_nodes} wall node(s)")
+else:
+    print("[bc] ALPHA_WALL <= 0 -- walls left fully rigid "
+          "(no absorption BC applied)")
+mapdl.allsel()
+
+lap("wall absorption bc")
+
 # ==== BOUNDARY CONDITIONS ====================================================
 
-src_node = mapdl.queries.node(SRC_X, SRC_Y, SRC_Z)
-mapdl.bf(src_node, "MASS", SRC_MASS_MAGNITUDE, 0.0)
-
-mapdl.asel("S", "AREA", vmin=wall_areas[0])
-for a in wall_areas[1:]:
-    mapdl.asel("A", "AREA", vmin=a)
-mapdl.nsla("S", 1)
-mapdl.sf("all", "IMPD", Z_WALL)
+mapdl.ksel("S", "KP", vmin=src_kp)
+mapdl.nslk()
+n_src_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
+if n_src_nodes != 1:
+    raise RuntimeError(
+        f"expected exactly 1 node at hard point KP={src_kp}, found "
+        f"{n_src_nodes} -- the hard point likely wasn't meshed "
+        "conformally; check mesh.n_node before/after meshing.")
+src_node = int(mapdl.get_value(entity="node", entnum=0, item1="num", it1num="min"))
 mapdl.allsel()
+
+
+mapdl.nsel("S", "NODE", vmin=src_node)
+mapdl.esln("S", 0)
+n_attached_elems = int(mapdl.get_value(entity="elem", entnum=0, item1="count"))
+print(f"[bc] node {src_node} has {n_attached_elems} FLUID221 element(s) attached")
+if n_attached_elems == 0:
+    raise RuntimeError(
+        f"node {src_node} has no elements attached -- it exists in the "
+        "database but isn't actually part of the mesh, so BF loads on it "
+        "have no effect on the solve. This points at the hard point "
+        "ending up isolated (e.g. the slice area wasn't fully consumed "
+        "by VMESH, or the two split volumes didn't mesh as one "
+        "conformal set).")
+mapdl.allsel()
+
+# Frequency dependent point mass source
+
+N_TABLE = 50   # densely enough sampled that linear interpolation between
+               # table points tracks the 1/f curve closely; independent
+               # of N_SUBSTEPS, just needs to smoothly cover the range
+table_freqs = np.linspace(FREQ_MIN, FREQ_MAX, N_TABLE)
+table_values = SRC_MASS_MAGNITUDE / table_freqs
+
+SRC_TABLE = "src_mass_tab"
+mapdl.dim(SRC_TABLE, "TABLE", N_TABLE, 1, 1, "FREQ")
+for i, (f_i, v_i) in enumerate(zip(table_freqs, table_values), start=1):
+    mapdl.run(f"{SRC_TABLE}({i},0) = {f_i}")
+    mapdl.run(f"{SRC_TABLE}({i},1) = {v_i}")
+print(f"[bc] frequency-dependent source table '{SRC_TABLE}': {N_TABLE} "
+      f"points, {table_values.min():.3e} to {table_values.max():.3e} kg/s "
+      f"over {FREQ_MIN:.1f}-{FREQ_MAX:.1f} Hz")
+
+mapdl.bf(src_node, "MASS", f"%{SRC_TABLE}%", 0.0)
+print(f"[bc] source keypoint {src_kp} -> node {src_node} at "
+      f"({SRC_X}, {SRC_Y}, {SRC_Z}) m, frequency-scaled mass source "
+      f"(base {SRC_MASS_MAGNITUDE} kg/s at 1 Hz) applied")
+
+
+print(mapdl.bflist(src_node, "all"))
+
+mapdl.allsel()
+
+mapdl.save(fname=JOBNAME, ext="db")
+mapdl.download(f"{JOBNAME}.db", target_dir=DIR_MODEL)
 
 lap("boundary conditions")
 
@@ -194,65 +377,71 @@ solved_freqs = np.unique(mapdl.post_processing.time_values)
 # ==== POST-PROCESSING HELPERS ================================================
 
 def nodal_pressure(target_freq):
-    """Full-mesh complex pressure at the nearest solved frequency."""
+
+    """Return the complex nodal pressure at the target frequency."""
     f = solved_freqs[np.argmin(np.abs(solved_freqs - target_freq))]
+    mapdl.allsel()
     mapdl.set(time=f, kimg=0)
-    real = mapdl.get_array(entity="NODE", item1="PRES")
+    real = mapdl.post_processing.nodal_pressure()
     mapdl.set(time=f, kimg=1)
-    imag = mapdl.get_array(entity="NODE", item1="PRES")
+    imag = mapdl.post_processing.nodal_pressure()
     return f, real + 1j * imag
 
 
 def to_db(pa):
-    return 20 * np.log10(np.clip(np.abs(pa), 1e-12, None) / P_REF)
+    p_rms = np.abs(pa) / np.sqrt(2)
+    return 20 * np.log10(np.clip(p_rms, 1e-12, None) / P_REF)
 
 
-def listener_sweep(xyz, n_sets):
-    """Extract complex pressure and velocity at a listener point for all solved frequencies."""
-    probe = pv.PolyData(np.array([xyz]))
-    grid = mapdl.mesh.grid.copy()
-
+def listener_sweep(node, n_sets):
+    """Complex pressure at a listener node."""
     pres = np.zeros(n_sets, dtype=complex)
-    vel = np.zeros((n_sets, 3), dtype=complex)
+
     for i in range(1, n_sets + 1):
-        omega = 2 * np.pi * solved_freqs[i - 1]
-
         mapdl.set(lstep=1, sbstep=i, kimg=0)
-        grid.point_data["P_RE"] = mapdl.get_array(entity="NODE", item1="PRES")
+        p_re = mapdl.get_value(entity="node", entnum=node, item1="pres")
+
         mapdl.set(lstep=1, sbstep=i, kimg=1)
-        grid.point_data["P_IM"] = mapdl.get_array(entity="NODE", item1="PRES")
+        p_im = mapdl.get_value(entity="node", entnum=node, item1="pres")
 
-        grad_re = grid.compute_derivative(scalars="P_RE")["gradient"]
-        grad_im = grid.compute_derivative(scalars="P_IM")["gradient"]
-        grid.point_data["GX_RE"], grid.point_data["GY_RE"], grid.point_data["GZ_RE"] = \
-            grad_re[:, 0], grad_re[:, 1], grad_re[:, 2]
-        grid.point_data["GX_IM"], grid.point_data["GY_IM"], grid.point_data["GZ_IM"] = \
-            grad_im[:, 0], grad_im[:, 1], grad_im[:, 2]
+        pres[i - 1] = p_re + 1j * p_im
 
-        sampled = probe.sample(grid)
-        pres[i - 1] = sampled["P_RE"][0] + 1j * sampled["P_IM"][0]
-        grad_p = np.array([
-            sampled["GX_RE"][0] + 1j * sampled["GX_IM"][0],
-            sampled["GY_RE"][0] + 1j * sampled["GY_IM"][0],
-            sampled["GZ_RE"][0] + 1j * sampled["GZ_IM"][0],
-        ])
-        vel[i - 1] = 1j * grad_p / (omega * RHO_AIR)
-
-    return pres, vel
+    return pres
 
 
 # ==== LISTENER SWEEP =========================================================
 
+mapdl.ksel("S", "KP", vmin=listener_kp)
+mapdl.nslk()
+n_listener_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
+if n_listener_nodes != 1:
+    raise RuntimeError(
+        f"expected exactly 1 node at listener hard point KP={listener_kp}, "
+        f"found {n_listener_nodes} -- the hard point likely wasn't meshed "
+        "conformally; check mesh.n_node before/after meshing.")
+listener_node = int(mapdl.get_value(entity="node", entnum=0, item1="num", it1num="min"))
+mapdl.allsel()
+
+mapdl.nsel("S", "NODE", vmin=listener_node)
+mapdl.esln("S", 0)
+n_listener_elems = int(mapdl.get_value(entity="elem", entnum=0, item1="count"))
+print(f"[listener] node {listener_node} has {n_listener_elems} FLUID221 "
+      f"element(s) attached")
+if n_listener_elems == 0:
+    raise RuntimeError(
+        f"listener node {listener_node} has no elements attached -- it "
+        "exists in the database but isn't actually part of the mesh.")
+mapdl.allsel()
+
+_lx = mapdl.get_value(entity="node", entnum=listener_node, item1="loc", it1num="x")
+_ly = mapdl.get_value(entity="node", entnum=listener_node, item1="loc", it1num="y")
+_lz = mapdl.get_value(entity="node", entnum=listener_node, item1="loc", it1num="z")
+print(f"[listener] hard point KP={listener_kp} -> node {listener_node} at "
+      f"({_lx:.4f}, {_ly:.4f}, {_lz:.4f}) m")
+
 freqs = solved_freqs
-listener_pressure, listener_velocity = listener_sweep(LISTENER_XYZ, len(freqs))
+listener_pressure = listener_sweep(listener_node, len(freqs))
 listener_spl = to_db(listener_pressure)
-
-# Time-averaged acoustic intensity vector
-
-listener_intensity = 0.5 * np.real(
-    listener_pressure[:, None] * np.conj(listener_velocity))
-listener_intensity_mag = np.linalg.norm(listener_intensity, axis=1)
-listener_velocity_mag = np.linalg.norm(np.abs(listener_velocity), axis=1)
 lap("listener sweep")
 
 
@@ -260,11 +449,23 @@ lap("listener sweep")
 
 modes = rigid_room_modes(LX, LY, LZ, C0, FREQ_MIN, FREQ_MAX)
 
-mode_spl = [listener_spl[np.argmin(np.abs(freqs - m))] for m in modes]
-_mode_order = np.argsort(mode_spl)[::-1][:NUM_PEAKS]
-plot_freqs = sorted(modes[i] for i in _mode_order)
+N_BANDS = 4                    # number of frequency bands
+PLANES_PER_BAND = 2            # how many modes to plot per band
+band_edges = np.linspace(FREQ_MIN, FREQ_MAX, N_BANDS + 1)
 
-print(f"[sweep] modes selected for field plots (Hz): {[round(f, 1) for f in plot_freqs]}")
+plot_freqs = []
+for lo, hi in zip(band_edges[:-1], band_edges[1:]):
+    band_modes = [m for m in modes if lo <= m < hi]
+    if not band_modes:
+        continue
+    band_spl = [listener_spl[np.argmin(np.abs(freqs - m))] for m in band_modes]
+    order = np.argsort(band_spl)[::-1][:PLANES_PER_BAND]
+    plot_freqs.extend(band_modes[i] for i in order)
+
+plot_freqs = sorted(plot_freqs)
+_plot_freqs_str = ", ".join(f"{f:.1f}" for f in plot_freqs)
+print(f"[sweep] modes selected for field plots (Hz, band-stratified, "
+      f"{PLANES_PER_BAND}/band): [{_plot_freqs_str}]")
 
 # ==== LISTENER SPL PLOT ======================================================
 
@@ -278,29 +479,6 @@ fig.tight_layout()
 fig.savefig(os.path.join(OUTPUT_DIR, "listener_sweep.png"), dpi=150)
 plt.close(fig)
 lap("listener sweep plot")
-
-# ==== LISTENER VELOCITY / INTENSITY PLOTS ====================================
-
-fig, ax = plt.subplots(figsize=(7.5, 4.5))
-ax.plot(freqs, listener_velocity_mag, color="tab:blue")
-ax.set_xlabel("Frequency (Hz)")
-ax.set_ylabel("Particle velocity magnitude (m/s)")
-ax.set_title("Listener particle velocity response")
-ax.grid(True, alpha=0.3)
-fig.tight_layout()
-fig.savefig(os.path.join(OUTPUT_DIR, "listener_velocity.png"), dpi=150)
-plt.close(fig)
-
-fig, ax = plt.subplots(figsize=(7.5, 4.5))
-ax.plot(freqs, listener_intensity_mag, color="tab:green")
-ax.set_xlabel("Frequency (Hz)")
-ax.set_ylabel("Sound intensity magnitude (W/m^2)")
-ax.set_title("Listener sound intensity response")
-ax.grid(True, alpha=0.3)
-fig.tight_layout()
-fig.savefig(os.path.join(OUTPUT_DIR, "listener_intensity.png"), dpi=150)
-plt.close(fig)
-lap("listener velocity/intensity plots")
 
 # ==== RESONANCE FIELD MAPS ===================================================
 
@@ -320,17 +498,40 @@ def plot_3d(f, field, tag, vmin, vmax):
         DIR_3D_PRESSURE, f"spl_3d_{f:.0f}Hz_{tag}.png"))
 
 
-def plot_plane(f, field, plane_z, tag, vmin, vmax):
-    grid = mapdl.mesh.grid.copy()
-    grid.point_data["SPL (dB)"] = to_db(field)
+def plot_plane(f, plane_z, tag, vmin, vmax):
     
-    plane_slice = grid.slice(normal="z", origin=(0, 0, plane_z + 1e-4))
-    pts = plane_slice.points
-    spl = np.clip(plane_slice.point_data["SPL (dB)"], vmin, vmax)
+    mapdl.allsel()
+    mapdl.nsel("S", "LOC", "Z", plane_z)
+    n_pts = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
+    if n_pts == 0:
+        raise RuntimeError(
+            f"no nodes found at z={plane_z} m -- this height wasn't "
+            "included as a geometry slice plane; check PLANE_HEIGHTS_Z "
+            "against the slice_heights list built in ROOM GEOMETRY.")
+
+    coords = mapdl.mesh.nodes
+    if coords.shape[0] != n_pts:
+        raise RuntimeError(
+            f"mapdl.mesh.nodes returned {coords.shape[0]} nodes but "
+            f"{n_pts} are selected at z={plane_z} m -- selection state "
+            "and mesh.nodes are out of sync; re-check ordering assumptions.")
+    pts_x, pts_y = coords[:, 0], coords[:, 1]
+
+    mapdl.set(time=f, kimg=0)
+    p_re = mapdl.post_processing.nodal_pressure()
+    mapdl.set(time=f, kimg=1)
+    p_im = mapdl.post_processing.nodal_pressure()
+    if p_re.shape[0] != n_pts or p_im.shape[0] != n_pts:
+        raise RuntimeError(
+            f"post_processing.nodal_pressure() returned "
+            f"{p_re.shape[0]}/{p_im.shape[0]} values but {n_pts} nodes "
+            f"are selected at z={plane_z} m -- selection state mismatch.")
+    spl = np.clip(to_db(p_re + 1j * p_im), vmin, vmax)
 
     fig, ax = plt.subplots(figsize=(7, 5.5))
     levels = np.linspace(vmin, vmax, 101)
-    tpc = ax.tricontourf(pts[:, 0], pts[:, 1], spl, levels=levels, cmap="jet")
+
+    tpc = ax.tricontourf(pts_x, pts_y, spl, levels=levels, cmap="jet")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
     ax.set_title(f"SPL field at z={plane_z:.2f} m, f={f:.1f} Hz ({tag})")
@@ -340,6 +541,7 @@ def plot_plane(f, field, plane_z, tag, vmin, vmax):
     fig.savefig(os.path.join(
         DIR_3D_PLANE, f"spl_plane_{f:.0f}Hz_z{plane_z:.2f}m_{tag}.png"), dpi=150)
     plt.close(fig)
+    mapdl.allsel()
 
 
 mapdl.allsel()
@@ -357,7 +559,7 @@ lap("field extraction")
 for f, field in peak_cache:
     plot_3d(f, field, "peak", global_min, global_max)
     for plane_z in PLANE_HEIGHTS_Z:
-        plot_plane(f, field, plane_z, "peak", global_min, global_max)
+        plot_plane(f, plane_z, "peak", global_min, global_max)
 lap("peak field plots")
 
 # ==== DONE ===================================================================
