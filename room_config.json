@@ -18,7 +18,7 @@
   "acoustics": {
     "speed_of_sound_m_s": 343.0,
     "air_density_kg_m3": 1.21,
-    "wall_absorption_coefficient": 0.05
+    "wall_absorption_coefficient": 0.01
   },
   "analysis": {
     "freq_min_hz": 20,
