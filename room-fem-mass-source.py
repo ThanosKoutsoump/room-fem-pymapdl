@@ -268,7 +268,7 @@ mapdl.mshape(1, "3D")
 mapdl.mshkey(0)
 
 mapdl.esize(ESIZE)  
-mapdl.smrtsize(SMART_SIZE) 
+#mapdl.smrtsize(SMART_SIZE) 
 
 mapdl.kesize(src_kp, HP_ELEM_SIZE)
 
