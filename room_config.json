@@ -6,15 +6,14 @@
   },
   "source": {
     "x_m": 2.087,
-    "y_m": 0.993,
-    "z_m": 0.166,
+    "y_m": 0.1,
+    "z_m": 0.186,
     "mass_source_kg_s": 1
   },
-  "probe": {
+  "listener": {
     "x_m": 0.05,
-    "y_m": 0.05,
-    "z_m": 0.05,
-    "mic_spacing_m": 0.05
+    "y_m": 1.08,
+    "z_m": 0.0
   },
   "acoustics": {
     "speed_of_sound_m_s": 343.0,
@@ -25,11 +24,11 @@
     "freq_min_hz": 50,
     "freq_max_hz": 300,
     "num_substeps": 500,
-    "elements_per_wavelength": 6
+    "elements_per_wavelength": 8
   },
   "plotting": {
     "plane_heights_z_m": [
-      0.166
+      0.186
     ]
   }
 }
