@@ -257,7 +257,8 @@ mapdl.mshkey(0)
 
 mapdl.esize(ESIZE)  
 #mapdl.smrtsize(SMART_SIZE) 
-mapdl.kesize(src_kp, HP_ELEM_SIZE)
+#mapdl.kesize(src_kp, HP_ELEM_SIZE)
+mapdl.kesize(listener_kp, HP_ELEM_SIZE)
 
 mapdl.allsel()
 
@@ -359,9 +360,7 @@ if ALPHA_WALL > 0:
             "no exterior wall areas found at the 6 bounding planes -- "
             "wall absorption BC was not applied.")
 
-    mapdl.nsla("S", 1)   # nkey=1: include nodes shared with unselected
-                         # areas/edges (wall corners, edges shared with
-                         # interior slice planes)
+    mapdl.nsla("S", 1)   # include nodes shared with unselected areas/edges
     n_wall_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
     mapdl.sf("ALL", "ATTN", ALPHA_WALL)
     print(f"[abs] absorption coefficient alpha={ALPHA_WALL} applied to "
@@ -418,7 +417,7 @@ mapdl.autots("off")
 mapdl.nsubst(N_SUBSTEPS)
 mapdl.kbc(0)
 mapdl.outres("erase")
-mapdl.outres("all", "none")
+mapdl.outres("all", "all")  
 mapdl.outres("nsol", "all")
 mapdl.solve()
 mapdl.finish()
@@ -462,14 +461,52 @@ def listener_sweep(node, n_sets):
 
     return pres
 
+def listener_velocity_sweep(node, n_sets):
+    """Complex particle velocity at a listener node."""
+    mapdl.allsel()
+    mapdl.nsel("S", "NODE", vmin=node)
+    mapdl.esln("S", 0)
+    attached_elems = mapdl.mesh.enum.tolist()
+
+    vel = np.zeros((n_sets, 4), dtype=complex)
+
+    for i in range(1, n_sets + 1):
+        comps = {}
+        for part, kimg in (("re", 0), ("im", 1)):
+            mapdl.set(lstep=1, sbstep=i, kimg=kimg)
+            mapdl.etable("pgx", "PG", "X")
+            mapdl.etable("pgy", "PG", "Y")
+            mapdl.etable("pgz", "PG", "Z")
+            comps[part] = {
+                c: np.mean([
+                    mapdl.get_value(entity="elem", entnum=e, item1="etab",
+                                     it1num=f"pg{c.lower()}")
+                    for e in attached_elems
+                ])
+                for c in ("x", "y", "z")
+            }
+
+        vx = comps["re"]["x"] + 1j * comps["im"]["x"]
+        vy = comps["re"]["y"] + 1j * comps["im"]["y"]
+        vz = comps["re"]["z"] + 1j * comps["im"]["z"]
+        vel[i - 1] = [vx, vy, vz, np.sqrt(np.abs(vx)**2 + np.abs(vy)**2 + np.abs(vz)**2)]
+
+    mapdl.allsel()   # restore full selection once, after the sweep is done
+    return vel
 
 # ==== LISTENER SWEEP ============================================================
 
 freqs = solved_freqs
 listener_pressure = listener_sweep(listener_node, len(freqs))
 listener_spl = to_db(listener_pressure)
-lap("listener sweep")
+listener_velocity = listener_velocity_sweep(listener_node, len(freqs))
+listener_vmag_rms = np.abs(listener_velocity[:, 3]) / np.sqrt(2)   # RMS |v|, m/s
 
+vmag = np.sqrt(np.abs(listener_velocity[:, 0])**2
+                         + np.abs(listener_velocity[:, 1])**2
+                         + np.abs(listener_velocity[:, 2])**2) / np.sqrt(2)
+
+lap("listener sweep")
 
 # ==== THEORETICAL MODES ======================================================
 
@@ -505,6 +542,41 @@ fig.tight_layout()
 fig.savefig(os.path.join(OUTPUT_DIR, "listener_sweep.png"), dpi=150)
 plt.close(fig)
 lap("listener sweep plot")
+
+
+# ==== LISTENER VELOCITY PLOT =================================================
+
+fig, ax = plt.subplots(figsize=(7.5, 4.5))
+ax.plot(freqs, listener_vmag_rms, color="tab:blue")
+ax.set_xlabel("Frequency (Hz)")
+ax.set_ylabel("Particle velocity, RMS (m/s)")
+ax.set_title(f"Listener particle velocity magnitude at ({_lx:.2f}, {_ly:.2f}, {_lz:.2f}) m")
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+fig.savefig(os.path.join(OUTPUT_DIR, "listener_velocity_sweep.png"), dpi=150)
+plt.close(fig)
+lap("listener velocity plot")
+
+# ==== LISTENER SPL + VELOCITY COMBINED PLOT ==================================
+
+fig, ax1 = plt.subplots(figsize=(8, 4.5))
+
+ax1.plot(freqs, listener_spl, color="tab:orange", label="SPL")
+ax1.set_xlabel("Frequency (Hz)")
+ax1.set_ylabel("SPL, unweighted (dB)", color="tab:orange")
+ax1.tick_params(axis="y", labelcolor="tab:orange")
+ax1.grid(True, alpha=0.3)
+
+ax2 = ax1.twinx()
+ax2.plot(freqs, listener_vmag_rms, color="tab:blue", label="Velocity")
+ax2.set_ylabel("Particle velocity, RMS (m/s)", color="tab:blue")
+ax2.tick_params(axis="y", labelcolor="tab:blue")
+
+ax1.set_title(f"Listener SPL and particle velocity at ({_lx:.2f}, {_ly:.2f}, {_lz:.2f}) m")
+fig.tight_layout()
+fig.savefig(os.path.join(OUTPUT_DIR, "listener_spl_velocity_combined.png"), dpi=150)
+plt.close(fig)
+lap("listener combined plot")
 
 # ==== RESONANCE FIELD MAPS ===================================================
 
