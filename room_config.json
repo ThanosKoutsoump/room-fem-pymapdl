@@ -23,8 +23,8 @@
   "analysis": {
     "freq_min_hz": 50,
     "freq_max_hz": 300,
-    "num_substeps": 500,
-    "elements_per_wavelength": 8
+    "num_substeps": 250,
+    "elements_per_wavelength": 6
   },
   "plotting": {
     "plane_heights_z_m": [
