@@ -27,7 +27,7 @@ os.makedirs(DIR_3D_PLANE, exist_ok=True)
 os.makedirs(DIR_3D_DATA, exist_ok=True)
 os.makedirs(DIR_MODEL, exist_ok=True)
 
-JOBNAME = "room_acoustics"     # used for the .db export
+JOBNAME = "room_fem"     # used for the .db export
 
 # ==== TIMER ================================================================
 
@@ -65,9 +65,9 @@ SRC_Y = _cfg["source"]["y_m"]
 SRC_Z = _cfg["source"]["z_m"]
 SRC_MASS_MAGNITUDE = _cfg["source"]["mass_source_kg_s"]
 
-PROBE_XYZ = (_cfg["probe"]["x_m"], _cfg["probe"]["y_m"], _cfg["probe"]["z_m"])
-PROBE_X, PROBE_Y, PROBE_Z = PROBE_XYZ
-PROBE_SPACING = _cfg["probe"]["mic_spacing_m"]
+LISTENER_XYZ = (_cfg["listener"]["x_m"], _cfg["listener"]["y_m"],
+                _cfg["listener"]["z_m"])
+LISTENER_X, LISTENER_Y, LISTENER_Z = LISTENER_XYZ
 
 C0 = _cfg["acoustics"]["speed_of_sound_m_s"]
 RHO_AIR = _cfg["acoustics"]["air_density_kg_m3"]
@@ -83,7 +83,7 @@ PLANE_HEIGHTS_Z = _cfg["plotting"]["plane_heights_z_m"]
 
 # Wavelength-based target element size.
 ESIZE = C0 / (FREQ_MAX * ELEMS_PER_WAVELENGTH)
-SMART_SIZE = 9
+SMART_SIZE = 6
 HP_ELEM_SIZE = ESIZE / 2    # target edge length right at the hard point
 
 P_REF = 20e-6               # 0 dB SPL reference pressure (Pa)
@@ -117,6 +117,7 @@ mapdl = launch_mapdl(
 )
 lap("launch_mapdl")
 mapdl.clear()
+mapdl.filname(JOBNAME)
 mapdl.prep7()
 mapdl.units("SI")
 
@@ -147,14 +148,16 @@ room_vol = mapdl.va(front_wall, back_wall, floor, ceiling, left_wall, right_wall
 # Geometric slices at source, probe, and every plotting height
 
 SLICE_TOL = 1e-6
-_raw_heights = [SRC_Z, PROBE_Z] + list(PLANE_HEIGHTS_Z)
+_raw_heights = [SRC_Z, LISTENER_Z] + list(PLANE_HEIGHTS_Z)
 _interior_heights = [z for z in _raw_heights if SLICE_TOL < z < LZ - SLICE_TOL]
 slice_heights = []
 for z in sorted(_interior_heights):
     if not slice_heights or abs(z - slice_heights[-1]) > SLICE_TOL:
         slice_heights.append(z)
-print(f"[geometry] slicing the room at z = {slice_heights} m "
-      f"(source + probe hard points + plotting planes)")
+
+if slice_heights:
+    print(f"[geometry] slicing the room at z = {slice_heights} m "
+    f"(source + listener hard points + plotting planes)")
 
 _wp_z = 0.0
 for z in slice_heights:
@@ -165,29 +168,32 @@ for z in slice_heights:
 mapdl.wpoffs(0, 0, -_wp_z)   # restore the working plane to the global origin
 mapdl.allsel()
 
-
-mapdl.vglue("ALL")
-mapdl.allsel()
-n_vols = int(mapdl.get_value(entity="volu", entnum=0, item1="count"))
-print(f"[geometry] {n_vols} volume(s) after slicing at {slice_heights} m "
+if slice_heights:
+    mapdl.vglue("ALL")
+    mapdl.allsel()
+    n_vols = int(mapdl.get_value(entity="volu", entnum=0, item1="count"))
+    print(f"[geometry] {n_vols} volume(s) after slicing at {slice_heights} m "
       f"(expected {len(slice_heights) + 1})")
-if n_vols != len(slice_heights) + 1:
-    raise RuntimeError(
+    if n_vols != len(slice_heights) + 1:
+        raise RuntimeError(
         f"expected {len(slice_heights) + 1} volumes after slicing at "
         f"{slice_heights} m, found {n_vols} -- one or more of the "
         "requested slice heights likely didn't produce a real cut; check "
         "each height individually with ASEL,S,LOC,Z,<height> in APDL.")
+    
+
 
 mapdl.asel("S", "LOC", "Z", SRC_Z)
 n_slice_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
 
-print(f"[geometry] found {n_slice_areas} slice area(s) at z={SRC_Z} m")
-if n_slice_areas != 1:
-    raise RuntimeError(
-        f"expected exactly 1 interior area at z=SRC_Z ({SRC_Z} m), found "
-        f"{n_slice_areas} -- the slicing may not have produced the "
-        "expected geometry; check PLANE_HEIGHTS_Z and SRC_Z for "
-        "near-duplicate heights.")
+if slice_heights:
+    print(f"[geometry] found {n_slice_areas} slice area(s) at z={SRC_Z} m")
+    if n_slice_areas != 1:
+        raise RuntimeError(
+            f"expected exactly 1 interior area at z=SRC_Z ({SRC_Z} m), found "
+            f"{n_slice_areas} -- the slicing may not have produced the "
+            "expected geometry; check PLANE_HEIGHTS_Z and SRC_Z for "
+            "near-duplicate heights.")
 
 slice_area = int(mapdl.get_value(entity="area", entnum=0, item1="num", it1num="max"))
 mapdl.hptcreate("AREA", slice_area, "", "COORD", SRC_X, SRC_Y, SRC_Z)
@@ -202,61 +208,43 @@ if abs(hp_z - SRC_Z) > 1e-9 or abs(hp_x - SRC_X) > 1e-9 or abs(hp_y - SRC_Y) > 1
     raise RuntimeError(
         f"hard point KP={src_kp} is at ({hp_x}, {hp_y}, {hp_z}) m, not "
         f"({SRC_X}, {SRC_Y}, {SRC_Z}) m -- it did not land on the slice.")
-print(f"[geometry] hard point KP={src_kp} confirmed at "
-      f"({hp_x:.4f}, {hp_y:.4f}, {hp_z:.4f}) m, on the z={SRC_Z} m slice")
-
-
-mapdl.allsel()
-
-# ---- intensity probe hard points -------------------------------------------
+print(f"[geometry] source hard point KP={src_kp} confirmed at "
+      f"({hp_x:.4f}, {hp_y:.4f}, {hp_z:.4f}) m, on the z={SRC_Z} m plane")
 
 mapdl.allsel()
-mapdl.asel("S", "LOC", "Z", PROBE_Z)
-n_probe_slice_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
-print(f"[geometry] found {n_probe_slice_areas} slice area(s) at "
-      f"z={PROBE_Z} m (intensity-probe plane)")
-if n_probe_slice_areas != 1:
-    raise RuntimeError(
-        f"expected exactly 1 interior area at z=PROBE_Z ({PROBE_Z} m), "
-        f"found {n_probe_slice_areas} -- check PLANE_HEIGHTS_Z, SRC_Z, "
-        "and PROBE_Z for near-duplicate heights.")
-probe_slice_area = int(mapdl.get_value(entity="area", entnum=0, item1="num", it1num="max"))
+mapdl.asel("S", "LOC", "Z", LISTENER_Z)
+n_listener_slice_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
 
-# Orient the probe axis along the line from the source to the probe
-
-_pdx = PROBE_X - SRC_X
-_pdy = PROBE_Y - SRC_Y
-_p_dist_xy = float(np.hypot(_pdx, _pdy))
-if _p_dist_xy < 1e-9:
-    raise RuntimeError(
-        "probe center coincides with the source in x-y -- can't define "
-        "a probe axis pointing away from the source.")
-PROBE_UX, PROBE_UY = _pdx / _p_dist_xy, _pdy / _p_dist_xy
-print(f"[geometry] probe axis unit vector (source -> probe), in the "
-      f"z={PROBE_Z} m plane: ({PROBE_UX:.4f}, {PROBE_UY:.4f})")
-
-mic_a_x = PROBE_X - 0.5 * PROBE_SPACING * PROBE_UX
-mic_a_y = PROBE_Y - 0.5 * PROBE_SPACING * PROBE_UY
-mic_b_x = PROBE_X + 0.5 * PROBE_SPACING * PROBE_UX
-mic_b_y = PROBE_Y + 0.5 * PROBE_SPACING * PROBE_UY
-
-mapdl.hptcreate("AREA", probe_slice_area, "", "COORD", mic_a_x, mic_a_y, PROBE_Z)
-mic_a_kp = int(mapdl.get_value(entity="kp", entnum=0, item1="num", it1num="max"))
-mapdl.hptcreate("AREA", probe_slice_area, "", "COORD", mic_b_x, mic_b_y, PROBE_Z)
-mic_b_kp = int(mapdl.get_value(entity="kp", entnum=0, item1="num", it1num="max"))
-
-for _label, _kp, _tx, _ty in [("mic_a", mic_a_kp, mic_a_x, mic_a_y),
-                               ("mic_b", mic_b_kp, mic_b_x, mic_b_y)]:
-    _hx = mapdl.get_value(entity="kp", entnum=_kp, item1="loc", it1num="x")
-    _hy = mapdl.get_value(entity="kp", entnum=_kp, item1="loc", it1num="y")
-    _hz = mapdl.get_value(entity="kp", entnum=_kp, item1="loc", it1num="z")
-    if abs(_hz - PROBE_Z) > 1e-9 or abs(_hx - _tx) > 1e-9 or abs(_hy - _ty) > 1e-9:
+if slice_heights:
+    print(f"[geometry] found {n_listener_slice_areas} slice area(s) at "
+      f"z={LISTENER_Z} m (listener plane)")
+    if n_listener_slice_areas != 1:
         raise RuntimeError(
-            f"probe hard point {_label} (KP={_kp}) is at ({_hx}, {_hy}, "
-            f"{_hz}) m, not ({_tx}, {_ty}, {PROBE_Z}) m -- it did not "
-            "land on the slice.")
-    print(f"[geometry] probe {_label} hard point KP={_kp} confirmed at "
-          f"({_hx:.4f}, {_hy:.4f}, {_hz:.4f}) m")
+        f"expected exactly 1 interior area at z=LISTENER_Z ({LISTENER_Z} "
+        f"m), found {n_listener_slice_areas} -- check PLANE_HEIGHTS_Z, "
+        "SRC_Z, and LISTENER_Z for near-duplicate heights.")
+
+
+listener_slice_area = int(mapdl.get_value(entity="area", entnum=0, item1="num", it1num="max"))
+mapdl.hptcreate("AREA", listener_slice_area, "", "COORD",
+                LISTENER_X, LISTENER_Y, LISTENER_Z)
+listener_kp = int(mapdl.get_value(entity="kp", entnum=0, item1="num", it1num="max"))
+
+lhp_x = mapdl.get_value(entity="kp", entnum=listener_kp, item1="loc", it1num="x")
+lhp_y = mapdl.get_value(entity="kp", entnum=listener_kp, item1="loc", it1num="y")
+lhp_z = mapdl.get_value(entity="kp", entnum=listener_kp, item1="loc", it1num="z")
+if (abs(lhp_z - LISTENER_Z) > 1e-9 or abs(lhp_x - LISTENER_X) > 1e-9
+        or abs(lhp_y - LISTENER_Y) > 1e-9):
+    raise RuntimeError(
+        f"listener hard point KP={listener_kp} is at ({lhp_x}, {lhp_y}, "
+        f"{lhp_z}) m, not ({LISTENER_X}, {LISTENER_Y}, {LISTENER_Z}) m "
+        "-- it did not land on the slice.")
+
+print(f"[geometry] listener hard point KP={listener_kp} confirmed at "
+      f"({lhp_x:.4f}, {lhp_y:.4f}, {lhp_z:.4f}) m, on the "
+      f"z={LISTENER_Z} m plane")
+
+
 
 mapdl.allsel()
 
@@ -269,7 +257,6 @@ mapdl.mshkey(0)
 
 mapdl.esize(ESIZE)  
 #mapdl.smrtsize(SMART_SIZE) 
-
 mapdl.kesize(src_kp, HP_ELEM_SIZE)
 
 mapdl.allsel()
@@ -278,57 +265,8 @@ mapdl.type(1)
 mapdl.mat(1)
 mapdl.vmesh("all")
 
-print(f"[mesh] {mapdl.mesh.n_elem} elements, {mapdl.mesh.n_node} nodes "
-      "(before probe refinement)")
+print(f"[mesh] {mapdl.mesh.n_elem} elements, {mapdl.mesh.n_node} nodes ")
 
-
-def _kp_to_single_node(kp, label):
-    """Resolve a hard-point keypoint to its one conformal mesh node,
-    with the same existence/uniqueness checks used elsewhere."""
-    mapdl.allsel()
-    mapdl.ksel("S", "KP", vmin=kp)
-    mapdl.nslk()
-    n = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
-    if n != 1:
-        raise RuntimeError(
-            f"expected exactly 1 node at hard point KP={kp} ({label}), "
-            f"found {n} -- the hard point likely wasn't meshed "
-            "conformally; check mesh.n_node before/after meshing.")
-    node = int(mapdl.get_value(entity="node", entnum=0, item1="num", it1num="min"))
-    mapdl.allsel()
-    return node
-
-
-mic_a_node = _kp_to_single_node(mic_a_kp, "mic_a")
-mic_b_node = _kp_to_single_node(mic_b_kp, "mic_b")
-
-# ---- Local refinement around the probe -----------------------------
-
-PROBE_REFINE_LEVEL = 2   # 1-5, higher = finer within the refined region
-PROBE_REFINE_DEPTH = 1   # element layers outward from mic_a/mic_b -- the radius
-
-mapdl.allsel()
-mapdl.nrefine(mic_a_node, mic_b_node, "", PROBE_REFINE_LEVEL,
-              PROBE_REFINE_DEPTH, "CLEAN", "ON")
-mapdl.allsel()
-
-print(f"[mesh] {mapdl.mesh.n_elem} elements, {mapdl.mesh.n_node} nodes "
-      f"(after probe refinement: level={PROBE_REFINE_LEVEL}, "
-      f"depth={PROBE_REFINE_DEPTH})")
-
-mic_a_node = _kp_to_single_node(mic_a_kp, "mic_a")
-mic_b_node = _kp_to_single_node(mic_b_kp, "mic_b")
-for _label, _node in [("mic_a", mic_a_node), ("mic_b", mic_b_node)]:
-    mapdl.nsel("S", "NODE", vmin=_node)
-    mapdl.esln("S", 0)
-    _n_elems = int(mapdl.get_value(entity="elem", entnum=0, item1="count"))
-    print(f"[mesh] {_label} node {_node} has {_n_elems} FLUID221 "
-          f"element(s) attached after refinement")
-    if _n_elems == 0:
-        raise RuntimeError(
-            f"probe {_label} node {_node} lost its element connectivity "
-            "during NREFINE -- try a different DEPTH/LEVEL, or check "
-            "whether it landed on a boundary NREFINE couldn't cross.")
 mapdl.allsel()
 
 # Mesh for ParaView.
@@ -337,39 +275,9 @@ mesh_grid.save(os.path.join(DIR_3D_DATA, "mesh.vtu"))
 
 lap("mesh")
 
-# ==== WALL ABSORPTION ========================================================
+# =====RESOLVE KEYPOINTS=====
 
-mapdl.allsel()
-if ALPHA_WALL > 0:
-    mapdl.asel("S", "LOC", "X", 0)
-    mapdl.asel("A", "LOC", "X", LX)
-    mapdl.asel("A", "LOC", "Y", 0)
-    mapdl.asel("A", "LOC", "Y", LY)
-    mapdl.asel("A", "LOC", "Z", 0)
-    mapdl.asel("A", "LOC", "Z", LZ)
-    n_wall_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
-    print(f"[bc] {n_wall_areas} exterior wall area(s) selected for "
-          f"absorption (alpha={ALPHA_WALL})")
-    if n_wall_areas == 0:
-        raise RuntimeError(
-            "no exterior wall areas found at the 6 bounding planes -- "
-            "wall absorption BC was not applied.")
-
-    mapdl.nsla("S", 1)   # nkey=1: include nodes shared with unselected
-                         # areas/edges (wall corners, edges shared with
-                         # interior slice planes)
-    n_wall_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
-    mapdl.sf("ALL", "ATTN", ALPHA_WALL)
-    print(f"[bc] absorption coefficient alpha={ALPHA_WALL} applied to "
-          f"{n_wall_nodes} wall node(s)")
-else:
-    print("[bc] ALPHA_WALL <= 0 -- walls left fully rigid "
-          "(no absorption BC applied)")
-mapdl.allsel()
-
-lap("wall absorption bc")
-
-# ==== BOUNDARY CONDITIONS ====================================================
+# Source
 
 mapdl.ksel("S", "KP", vmin=src_kp)
 mapdl.nslk()
@@ -386,7 +294,7 @@ mapdl.allsel()
 mapdl.nsel("S", "NODE", vmin=src_node)
 mapdl.esln("S", 0)
 n_attached_elems = int(mapdl.get_value(entity="elem", entnum=0, item1="count"))
-print(f"[bc] node {src_node} has {n_attached_elems} FLUID221 element(s) attached")
+print(f"[nodes] source node {src_node} has {n_attached_elems} FLUID221 element(s) attached")
 if n_attached_elems == 0:
     raise RuntimeError(
         f"node {src_node} has no elements attached -- it exists in the "
@@ -396,6 +304,80 @@ if n_attached_elems == 0:
         "by VMESH, or the two split volumes didn't mesh as one "
         "conformal set).")
 mapdl.allsel()
+
+_sx = mapdl.get_value(entity="node", entnum=src_node, item1="loc", it1num="x")
+_sy = mapdl.get_value(entity="node", entnum=src_node, item1="loc", it1num="y")
+_sz = mapdl.get_value(entity="node", entnum=src_node, item1="loc", it1num="z")
+print(f"[nodes] source hard point KP={src_kp} -> node {src_node} at "
+      f"({_sx:.4f}, {_sy:.4f}, {_sz:.4f}) m")
+
+#Listener
+
+mapdl.ksel("S", "KP", vmin=listener_kp)
+mapdl.nslk()
+n_listener_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
+if n_listener_nodes != 1:
+    raise RuntimeError(
+        f"expected exactly 1 node at listener hard point KP={listener_kp}, "
+        f"found {n_listener_nodes} -- the hard point likely wasn't meshed "
+        "conformally; check mesh.n_node before/after meshing.")
+listener_node = int(mapdl.get_value(entity="node", entnum=0, item1="num", it1num="min"))
+mapdl.allsel()
+
+mapdl.nsel("S", "NODE", vmin=listener_node)
+mapdl.esln("S", 0)
+n_listener_elems = int(mapdl.get_value(entity="elem", entnum=0, item1="count"))
+print(f"[nodes] listener node {listener_node} has {n_listener_elems} FLUID221 "
+      f"element(s) attached")
+if n_listener_elems == 0:
+    raise RuntimeError(
+        f"listener node {listener_node} has no elements attached -- it "
+        "exists in the database but isn't actually part of the mesh.")
+mapdl.allsel()
+
+_lx = mapdl.get_value(entity="node", entnum=listener_node, item1="loc", it1num="x")
+_ly = mapdl.get_value(entity="node", entnum=listener_node, item1="loc", it1num="y")
+_lz = mapdl.get_value(entity="node", entnum=listener_node, item1="loc", it1num="z")
+print(f"[nodes] listener hard point KP={listener_kp} -> node {listener_node} at "
+      f"({_lx:.4f}, {_ly:.4f}, {_lz:.4f}) m")
+
+# ==== WALL ABSORPTION ========================================================
+
+mapdl.allsel()
+if ALPHA_WALL > 0:
+    mapdl.asel("S", "LOC", "X", 0)
+    mapdl.asel("A", "LOC", "X", LX)
+    mapdl.asel("A", "LOC", "Y", 0)
+    mapdl.asel("A", "LOC", "Y", LY)
+    mapdl.asel("A", "LOC", "Z", 0)
+    mapdl.asel("A", "LOC", "Z", LZ)
+    n_wall_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
+    print(f"[abs] {n_wall_areas} exterior wall area(s) selected for "
+          f"absorption (alpha={ALPHA_WALL})")
+    if n_wall_areas == 0:
+        raise RuntimeError(
+            "no exterior wall areas found at the 6 bounding planes -- "
+            "wall absorption BC was not applied.")
+
+    mapdl.nsla("S", 1)   # nkey=1: include nodes shared with unselected
+                         # areas/edges (wall corners, edges shared with
+                         # interior slice planes)
+    n_wall_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
+    mapdl.sf("ALL", "ATTN", ALPHA_WALL)
+    print(f"[abs] absorption coefficient alpha={ALPHA_WALL} applied to "
+          f"{n_wall_nodes} wall node(s)")
+else:
+    print("[abs] ALPHA_WALL <= 0 -- walls left fully rigid "
+          "(no absorption BC applied)")
+    
+for label, node in (("source", src_node), ("listener", listener_node)):
+    mapdl.nsel("S", "NODE", vmin=node)
+    mapdl.sf("ALL", "ATTN", 0)
+    print(f"[abs] {label} node {node} exempted from wall absorption "
+          f"(ATTN reset to 0)")
+mapdl.allsel()    
+
+# ==== BOUNDARY CONDITIONS ====================================================
 
 # Frequency dependent point mass source
 
@@ -440,6 +422,7 @@ mapdl.outres("all", "none")
 mapdl.outres("nsol", "all")
 mapdl.solve()
 mapdl.finish()
+mapdl.download(f"{JOBNAME}.rst", target_dir=DIR_MODEL)
 lap("harmonic solve")
 
 mapdl.post1()
@@ -464,8 +447,8 @@ def to_db(pa):
     return 20 * np.log10(np.clip(p_rms, 1e-12, None) / P_REF)
 
 
-def node_pressure_sweep(node, n_sets):
-    """Complex pressure at a node, swept across all solved substeps."""
+def listener_sweep(node, n_sets):
+    """Complex pressure at a listener node."""
     pres = np.zeros(n_sets, dtype=complex)
 
     for i in range(1, n_sets + 1):
@@ -480,23 +463,12 @@ def node_pressure_sweep(node, n_sets):
     return pres
 
 
-# ==== PROBE SWEEP ============================================================
+# ==== LISTENER SWEEP ============================================================
 
 freqs = solved_freqs
-
-actual_spacing = float(np.hypot(mic_b_x - mic_a_x, mic_b_y - mic_a_y))
-print(f"[probe] mic_a KP={mic_a_kp} -> node {mic_a_node} at "
-      f"({mic_a_x:.4f}, {mic_a_y:.4f}, {PROBE_Z:.4f}) m")
-print(f"[probe] mic_b KP={mic_b_kp} -> node {mic_b_node} at "
-      f"({mic_b_x:.4f}, {mic_b_y:.4f}, {PROBE_Z:.4f}) m")
-print(f"[probe] mic spacing: nominal {PROBE_SPACING:.4f} m, actual "
-      f"{actual_spacing:.4f} m")
-
-mic_a_pressure = node_pressure_sweep(mic_a_node, len(freqs))
-mic_b_pressure = node_pressure_sweep(mic_b_node, len(freqs))
-probe_pressure_avg = 0.5 * (mic_a_pressure + mic_b_pressure)
-probe_spl = to_db(probe_pressure_avg)
-lap("probe sweep")
+listener_pressure = listener_sweep(listener_node, len(freqs))
+listener_spl = to_db(listener_pressure)
+lap("listener sweep")
 
 
 # ==== THEORETICAL MODES ======================================================
@@ -512,7 +484,7 @@ for lo, hi in zip(band_edges[:-1], band_edges[1:]):
     band_modes = [m for m in modes if lo <= m < hi]
     if not band_modes:
         continue
-    band_spl = [probe_spl[np.argmin(np.abs(freqs - m))] for m in band_modes]
+    band_spl = [listener_spl[np.argmin(np.abs(freqs - m))] for m in band_modes]
     order = np.argsort(band_spl)[::-1][:PLANES_PER_BAND]
     plot_freqs.extend(band_modes[i] for i in order)
 
@@ -521,82 +493,18 @@ _plot_freqs_str = ", ".join(f"{f:.1f}" for f in plot_freqs)
 print(f"[sweep] modes selected for field plots (Hz, band-stratified, "
       f"{PLANES_PER_BAND}/band): [{_plot_freqs_str}]")
 
-# ==== PROBE SPL PLOT =========================================================
+# ==== LISTENER SPL PLOT ======================================================
 
 fig, ax = plt.subplots(figsize=(7.5, 4.5))
-ax.plot(freqs, probe_spl, color="tab:orange")
+ax.plot(freqs, listener_spl, color="tab:orange")
 ax.set_xlabel("Frequency (Hz)")
 ax.set_ylabel("SPL, unweighted (dB)")
-ax.set_title("Probe SPL response (avg of mic_a, mic_b)")
+ax.set_title(f"Listener SPL response at ({_lx:.2f}, {_ly:.2f}, {_lz:.2f}) m")
 ax.grid(True, alpha=0.3)
 fig.tight_layout()
-fig.savefig(os.path.join(OUTPUT_DIR, "probe_spl_sweep.png"), dpi=150)
+fig.savefig(os.path.join(OUTPUT_DIR, "listener_sweep.png"), dpi=150)
 plt.close(fig)
-lap("probe spl plot")
-
-# ==== SOUND INTENSITY (Brüel & Kjær / HBK) ===================================
-
-omega = 2.0 * np.pi * freqs
-
-probe_particle_velocity = ((mic_a_pressure - mic_b_pressure)
-                            / (1j * omega * RHO_AIR * actual_spacing))
-
-_p_rms = probe_pressure_avg / np.sqrt(2)
-_u_rms = probe_particle_velocity / np.sqrt(2)
-probe_intensity_complex = _p_rms * np.conj(_u_rms)
-probe_intensity_active = probe_intensity_complex.real     # W/m^2
-probe_intensity_reactive = probe_intensity_complex.imag   # W/m^2
-
-I_REF = 1e-12  # W/m^2 ISO 1683
-
-
-def to_intensity_level_db(intensity_w_m2):
-    """Convert intensity (W/m^2) to intensity level (dB)."""  # ONLY USED FOR PLOTS
-    mag = np.clip(np.abs(intensity_w_m2), 1e-30, None)
-    return np.sign(intensity_w_m2) * 10 * np.log10(mag / I_REF)
-
-probe_intensity_level_db = to_intensity_level_db(probe_intensity_active)
-probe_velocity_mag = np.abs(probe_particle_velocity)   # m/s
-
-probe_data_path = os.path.join(OUTPUT_DIR, "probe_intensity.csv")
-np.savetxt(
-    probe_data_path,
-    np.column_stack([
-        freqs, probe_spl, probe_intensity_active, probe_intensity_reactive,
-        probe_intensity_level_db, probe_velocity_mag,
-    ]),
-    delimiter=",",
-    header="freq_hz,probe_spl_db,intensity_active_w_m2,"
-           "intensity_reactive_w_m2,intensity_level_db,"
-           "velocity_mag_m_s",
-    comments="",
-)
-print(f"[probe] wrote {probe_data_path}")
-lap("sound intensity")
-
-# ==== PROBE INTENSITY PLOT ===================================================
-
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.5, 7.5), sharex=True)
-
-ax1.plot(freqs, probe_spl, color="tab:blue", label="SPL at probe (avg of mic_a, mic_b)")
-ax1.plot(freqs, probe_intensity_level_db, color="tab:red",
-         label="Intensity level (signed; + = toward corner)")
-ax1.set_ylabel("dB")
-ax1.set_title("Sound intensity probe -- level vs. frequency")
-ax1.legend(loc="best", fontsize=8)
-ax1.grid(True, alpha=0.3)
-
-ax2.plot(freqs, probe_velocity_mag, color="tab:purple")
-ax2.set_yscale("log")
-ax2.set_xlabel("Frequency (Hz)")
-ax2.set_ylabel("|u| (m/s)")
-ax2.set_title("Particle velocity magnitude at the probe")
-ax2.grid(True, which="both", alpha=0.3)
-
-fig.tight_layout()
-fig.savefig(os.path.join(OUTPUT_DIR, "probe_intensity.png"), dpi=150)
-plt.close(fig)
-lap("probe intensity plot")
+lap("listener sweep plot")
 
 # ==== RESONANCE FIELD MAPS ===================================================
 
@@ -623,7 +531,7 @@ def plot_plane(f, plane_z, tag, vmin, vmax):
     n_pts = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
     if n_pts == 0:
         raise RuntimeError(
-            f"no nodes found at z={plane_z} m -- this height wasn't "
+            f"no nodes found at z={plane_z:.3f} m -- this height wasn't "
             "included as a geometry slice plane; check PLANE_HEIGHTS_Z "
             "against the slice_heights list built in ROOM GEOMETRY.")
 
@@ -652,12 +560,12 @@ def plot_plane(f, plane_z, tag, vmin, vmax):
     tpc = ax.tricontourf(pts_x, pts_y, spl, levels=levels, cmap="jet")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
-    ax.set_title(f"SPL field at z={plane_z:.2f} m, f={f:.1f} Hz ({tag})")
+    ax.set_title(f"SPL field at z={plane_z:.3f} m, f={f:.1f} Hz ({tag})")
     ax.set_aspect("equal")
     fig.colorbar(tpc, ax=ax, label="SPL (dB)", format="%.0f")
     fig.tight_layout()
     fig.savefig(os.path.join(
-        DIR_3D_PLANE, f"spl_plane_{f:.0f}Hz_z{plane_z:.2f}m_{tag}.png"), dpi=150)
+        DIR_3D_PLANE, f"spl_plane_{f:.0f}Hz_z{plane_z:.3f}m_{tag}.png"), dpi=150)
     plt.close(fig)
     mapdl.allsel()
 
@@ -683,4 +591,8 @@ lap("peak field plots")
 # ==== DONE ===================================================================
 mapdl.exit()
 lap("mapdl exit")
+import shutil
+shutil.rmtree(_mapdl_log_dir, ignore_errors=True)
+print(f"[cleanup] removed MAPDL scratch dir {_mapdl_log_dir}; "
+      f"kept {JOBNAME}.db and {JOBNAME}.rst in {DIR_MODEL}")
 print(f"[timer] TOTAL: {time.perf_counter() - _T0:.2f} s")
