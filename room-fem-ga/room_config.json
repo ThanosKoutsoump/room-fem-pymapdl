@@ -1,0 +1,60 @@
+{
+  "room": {
+    "length_x_m": 2.264,
+    "length_y_m": 1.132,
+    "height_z_m": 0.186
+  },
+  "source": {
+    "x_m": 2.087,
+    "y_m": 0.993,
+    "z_m": 0.186,
+    "mass_source_kg_s": 1
+  },
+  "listener": {
+    "x_m": 1.1,
+    "y_m": 0.55,
+    "z_m": 0.09
+  },
+  "control_source": {
+    "center_x_m": 1.80,
+    "center_y_m": 0.20,
+    "z_m": 0.186,
+    "axis_x": 1.0,
+    "axis_y": 1.0,
+    "monopole_spacing_m": 0.15,
+    "hard_point_elem_size_m": null
+  },
+  "jp_grid": {
+    "plane_z_m": 0.186,
+    "n_points_x": 22,
+    "n_points_y": 12,
+    "interior_only": true,
+    "exclusion_radius_m": 0.1
+  },
+  "acoustics": {
+    "speed_of_sound_m_s": 343.0,
+    "air_density_kg_m3": 1.21,
+    "wall_absorption_coefficient": 0.01
+  },
+  "analysis": {
+    "freq_min_hz": 50,
+    "freq_max_hz": 300,
+    "num_substeps": 250,
+    "elements_per_wavelength": 10
+  },
+  "plotting": {
+    "plane_heights_z_m": [
+      0.186
+    ]
+  },
+  "ga": {
+    "l_min_db": 0.0,
+    "l_max_db": 20.0,
+    "max_l1_l2_diff_db": 20.0,
+    "population_size": 60,
+    "generations": 150,
+    "seed": 0,
+    "region_drop_db": 6.0,
+    "region_min_peak_prominence_db": 1.0
+  }
+}
