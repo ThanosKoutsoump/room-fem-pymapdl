@@ -378,7 +378,7 @@ mapdl.allsel()
 
 N_TABLE = 50
 table_freqs = np.linspace(FREQ_MIN, FREQ_MAX, N_TABLE)
-table_values = SRC_MASS_MAGNITUDE / table_freqs
+table_values = SRC_MASS_MAGNITUDE / (2 * np.pi * table_freqs)
 
 SRC_TABLE = "src_mass_tab"
 mapdl.load_table(SRC_TABLE, np.column_stack([table_freqs, table_values]),
