@@ -3,7 +3,7 @@
 import time
 import json
 import os
-import shutil
+import glob
 import numpy as np
 import matplotlib.pyplot as plt
 import pyvista as pv
@@ -17,7 +17,7 @@ from ansys.mapdl.core import launch_mapdl
 
 _job_id = os.environ.get("SLURM_JOB_ID", "local")
 
-OUTPUT_DIR = f"plots_{_job_id}"
+OUTPUT_DIR = os.path.join("runs", _job_id)
 DIR_3D_PRESSURE = os.path.join(OUTPUT_DIR, "3d_pressure")
 DIR_3D_PLANE = os.path.join(OUTPUT_DIR, "3d_plane")
 DIR_3D_DATA = os.path.join(OUTPUT_DIR, "3d_data")
@@ -28,7 +28,7 @@ os.makedirs(DIR_3D_PLANE, exist_ok=True)
 os.makedirs(DIR_3D_DATA, exist_ok=True)
 os.makedirs(DIR_MODEL, exist_ok=True)
 
-JOBNAME = "room_fem"     # used for the .db export
+JOBNAME = "room_fem"
 
 # ==== TIMER ================================================================
 
@@ -83,7 +83,6 @@ PLANE_HEIGHTS_Z = _cfg["plotting"]["plane_heights_z_m"]
 
 # Wavelength-based target element size.
 ESIZE = C0 / (FREQ_MAX * ELEMS_PER_WAVELENGTH)
-SMART_SIZE = 6
 HP_ELEM_SIZE = ESIZE / 2    # target edge length right at the hard point
 
 P_REF = 20e-6               # 0 dB SPL reference pressure (Pa)
@@ -107,21 +106,26 @@ def rigid_room_modes(lx, ly, lz, c, fmin, fmax, nmax=8):
 
 # ==== LAUNCH MAPDL ===========================================================
 
-_run_base = os.environ.get("MAPDL_RUN_BASE", os.getcwd())
-_mapdl_log_dir = os.path.join(_run_base, "mapdl_run", f"job_{_job_id}")
-os.makedirs(_mapdl_log_dir, exist_ok=True)
 
-# cores follow the Slurm allocation (--ntasks-per-node in the .sh file)
+_mapdl_run_dir = os.path.abspath(DIR_MODEL)
+
 nproc = int(os.environ.get("SLURM_NTASKS", 1))
 
 mapdl = launch_mapdl(
     nproc=nproc,
-    timeout=300,
-    run_location=_mapdl_log_dir,
+    timeout=80,
+    run_location=_mapdl_run_dir,
+    jobname=JOBNAME,
 )
 
-print(subprocess.run(["pgrep", "-af", "ansys"], capture_output=True, text=True).stdout,
-      flush=True)
+_n_ansys = subprocess.run(["pgrep", "-c", "-f", "ansys.e"],
+                          capture_output=True, text=True).stdout.strip() or "?"
+print(f"[run] job {_job_id} on {os.uname().nodename}: {nproc} core(s), "
+      f"{_n_ansys} MAPDL process(es)\n"
+      f"[run] room {LX} x {LY} x {LZ} m, {FREQ_MIN}-{FREQ_MAX} Hz in "
+      f"{N_SUBSTEPS} steps, element size {ESIZE:.3f} m "
+      f"({ELEMS_PER_WAVELENGTH}/wavelength), alpha={ALPHA_WALL}", flush=True)
+
 lap("launch_mapdl")
 
 # ==== ROOM GEOMETRY ==========================================================
@@ -191,67 +195,35 @@ if slice_heights:
             "requested slice heights likely didn't produce a real cut; check "
             "each height individually with ASEL,S,LOC,Z,<height> in APDL.")
 
-mapdl.asel("S", "LOC", "Z", SRC_Z)
-n_slice_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
 
-if slice_heights:
-    print(f"[geometry] found {n_slice_areas} slice area(s) at z={SRC_Z} m")
-    if n_slice_areas != 1:
+def make_hard_point(label, x, y, z):
+    """Keypoint exactly at (x, y, z) at height z."""
+    mapdl.allsel()
+    mapdl.asel("S", "LOC", "Z", z)
+    n_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
+    if n_areas != 1:
         raise RuntimeError(
-            f"expected exactly 1 interior area at z=SRC_Z ({SRC_Z} m), found "
-            f"{n_slice_areas} -- the slicing may not have produced the "
-            "expected geometry; check PLANE_HEIGHTS_Z and SRC_Z for "
-            "near-duplicate heights.")
+            f"{label}: expected exactly 1 horizontal area at z={z} m, found "
+            f"{n_areas} -- check PLANE_HEIGHTS_Z, SRC_Z and LISTENER_Z for "
+            "near-duplicate heights or a height outside the room.")
+    area = int(mapdl.get_value(entity="area", entnum=0, item1="num", it1num="max"))
+    mapdl.hptcreate("AREA", area, "", "COORD", x, y, z)
+    kp = int(mapdl.get_value(entity="kp", entnum=0, item1="num", it1num="max"))
 
-slice_area = int(mapdl.get_value(entity="area", entnum=0, item1="num", it1num="max"))
-mapdl.hptcreate("AREA", slice_area, "", "COORD", SRC_X, SRC_Y, SRC_Z)
-src_kp = int(mapdl.get_value(entity="kp", entnum=0, item1="num", it1num="max"))
-
-# Confirm the hard point landed exactly on the slice plane
-
-hp_x = mapdl.get_value(entity="kp", entnum=src_kp, item1="loc", it1num="x")
-hp_y = mapdl.get_value(entity="kp", entnum=src_kp, item1="loc", it1num="y")
-hp_z = mapdl.get_value(entity="kp", entnum=src_kp, item1="loc", it1num="z")
-if abs(hp_z - SRC_Z) > 1e-9 or abs(hp_x - SRC_X) > 1e-9 or abs(hp_y - SRC_Y) > 1e-9:
-    raise RuntimeError(
-        f"hard point KP={src_kp} is at ({hp_x}, {hp_y}, {hp_z}) m, not "
-        f"({SRC_X}, {SRC_Y}, {SRC_Z}) m -- it did not land on the slice.")
-print(f"[geometry] source hard point KP={src_kp} confirmed at "
-      f"({hp_x:.4f}, {hp_y:.4f}, {hp_z:.4f}) m, on the z={SRC_Z} m plane")
-
-mapdl.allsel()
-mapdl.asel("S", "LOC", "Z", LISTENER_Z)
-n_listener_slice_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
-
-if slice_heights:
-    print(f"[geometry] found {n_listener_slice_areas} slice area(s) at "
-          f"z={LISTENER_Z} m (listener plane)")
-    if n_listener_slice_areas != 1:
+    loc = [mapdl.get_value(entity="kp", entnum=kp, item1="loc", it1num=c)
+           for c in ("x", "y", "z")]
+    if max(abs(a - b) for a, b in zip(loc, (x, y, z))) > 1e-9:
         raise RuntimeError(
-            f"expected exactly 1 interior area at z=LISTENER_Z ({LISTENER_Z} "
-            f"m), found {n_listener_slice_areas} -- check PLANE_HEIGHTS_Z, "
-            "SRC_Z, and LISTENER_Z for near-duplicate heights.")
+            f"{label} hard point KP={kp} is at ({loc[0]}, {loc[1]}, {loc[2]}) m, "
+            f"not ({x}, {y}, {z}) m -- it did not land on the slice.")
+    print(f"[geometry] {label} hard point KP={kp} confirmed at "
+          f"({loc[0]:.4f}, {loc[1]:.4f}, {loc[2]:.4f}) m, on the z={z} m plane ")
+    mapdl.allsel()
+    return kp
 
-listener_slice_area = int(mapdl.get_value(entity="area", entnum=0, item1="num", it1num="max"))
-mapdl.hptcreate("AREA", listener_slice_area, "", "COORD",
-                LISTENER_X, LISTENER_Y, LISTENER_Z)
-listener_kp = int(mapdl.get_value(entity="kp", entnum=0, item1="num", it1num="max"))
 
-lhp_x = mapdl.get_value(entity="kp", entnum=listener_kp, item1="loc", it1num="x")
-lhp_y = mapdl.get_value(entity="kp", entnum=listener_kp, item1="loc", it1num="y")
-lhp_z = mapdl.get_value(entity="kp", entnum=listener_kp, item1="loc", it1num="z")
-if (abs(lhp_z - LISTENER_Z) > 1e-9 or abs(lhp_x - LISTENER_X) > 1e-9
-        or abs(lhp_y - LISTENER_Y) > 1e-9):
-    raise RuntimeError(
-        f"listener hard point KP={listener_kp} is at ({lhp_x}, {lhp_y}, "
-        f"{lhp_z}) m, not ({LISTENER_X}, {LISTENER_Y}, {LISTENER_Z}) m "
-        "-- it did not land on the slice.")
-
-print(f"[geometry] listener hard point KP={listener_kp} confirmed at "
-      f"({lhp_x:.4f}, {lhp_y:.4f}, {lhp_z:.4f}) m, on the "
-      f"z={LISTENER_Z} m plane")
-
-mapdl.allsel()
+src_kp = make_hard_point("source", SRC_X, SRC_Y, SRC_Z)
+listener_kp = make_hard_point("listener", LISTENER_X, LISTENER_Y, LISTENER_Z)
 
 lap("geometry")
 
@@ -262,7 +234,7 @@ mapdl.mshkey(0)
 
 mapdl.esize(ESIZE)
 # mapdl.kesize(src_kp, HP_ELEM_SIZE)
-mapdl.kesize(listener_kp, HP_ELEM_SIZE)
+# mapdl.kesize(listener_kp, HP_ELEM_SIZE)
 
 mapdl.allsel()
 
@@ -280,104 +252,59 @@ lap("mesh")
 
 # ==== RESOLVE KEYPOINTS ======================================================
 
-# Source
 
-mapdl.ksel("S", "KP", vmin=src_kp)
-mapdl.nslk()
-n_src_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
-if n_src_nodes != 1:
-    raise RuntimeError(
-        f"expected exactly 1 node at hard point KP={src_kp}, found "
-        f"{n_src_nodes} -- the hard point likely wasn't meshed "
-        "conformally; check mesh.n_node before/after meshing.")
-src_node = int(mapdl.get_value(entity="node", entnum=0, item1="num", it1num="min"))
-mapdl.allsel()
+def node_at_kp(label, kp):
+    """Single node on keypoint kp and its (x, y, z)."""
+    mapdl.allsel()
+    mapdl.ksel("S", "KP", vmin=kp)
+    mapdl.nslk()
+    n_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
+    if n_nodes != 1:
+        raise RuntimeError(
+            f"{label}: expected exactly 1 node at hard point KP={kp}, found "
+            f"{n_nodes} -- the hard point likely wasn't meshed conformally.")
+    node = int(mapdl.get_value(entity="node", entnum=0, item1="num", it1num="min"))
+    mapdl.allsel()
 
-mapdl.nsel("S", "NODE", vmin=src_node)
-mapdl.esln("S", 0)
-n_attached_elems = int(mapdl.get_value(entity="elem", entnum=0, item1="count"))
-print(f"[nodes] source node {src_node} has {n_attached_elems} FLUID221 element(s) attached")
-if n_attached_elems == 0:
-    raise RuntimeError(
-        f"node {src_node} has no elements attached -- it exists in the "
-        "database but isn't actually part of the mesh, so BF loads on it "
-        "have no effect on the solve. This points at the hard point "
-        "ending up isolated (e.g. the slice area wasn't fully consumed "
-        "by VMESH, or the two split volumes didn't mesh as one "
-        "conformal set).")
-mapdl.allsel()
+    mapdl.nsel("S", "NODE", vmin=node)
+    mapdl.esln("S", 0)
+    n_elems = int(mapdl.get_value(entity="elem", entnum=0, item1="count"))
+    mapdl.allsel()
+    print(f"[nodes] {label} node {node} has {n_elems} FLUID221 element(s) attached")
+    if n_elems == 0:
+        raise RuntimeError(
+            f"{label} node {node} has no elements attached -- it exists in the "
+            "database but isn't part of the mesh, so loads/results on it are "
+            "meaningless (e.g. the slice area wasn't fully consumed by VMESH).")
 
-_sx = mapdl.get_value(entity="node", entnum=src_node, item1="loc", it1num="x")
-_sy = mapdl.get_value(entity="node", entnum=src_node, item1="loc", it1num="y")
-_sz = mapdl.get_value(entity="node", entnum=src_node, item1="loc", it1num="z")
-print(f"[nodes] source hard point KP={src_kp} -> node {src_node} at "
-      f"({_sx:.4f}, {_sy:.4f}, {_sz:.4f}) m")
+    xyz = tuple(mapdl.get_value(entity="node", entnum=node, item1="loc", it1num=c)
+                for c in ("x", "y", "z"))
+    print(f"[nodes] {label} hard point KP={kp} -> node {node} at "
+          f"({xyz[0]:.4f}, {xyz[1]:.4f}, {xyz[2]:.4f}) m")
+    return node, xyz
 
-# Listener
 
-mapdl.ksel("S", "KP", vmin=listener_kp)
-mapdl.nslk()
-n_listener_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
-if n_listener_nodes != 1:
-    raise RuntimeError(
-        f"expected exactly 1 node at listener hard point KP={listener_kp}, "
-        f"found {n_listener_nodes} -- the hard point likely wasn't meshed "
-        "conformally; check mesh.n_node before/after meshing.")
-listener_node = int(mapdl.get_value(entity="node", entnum=0, item1="num", it1num="min"))
-mapdl.allsel()
-
-mapdl.nsel("S", "NODE", vmin=listener_node)
-mapdl.esln("S", 0)
-n_listener_elems = int(mapdl.get_value(entity="elem", entnum=0, item1="count"))
-print(f"[nodes] listener node {listener_node} has {n_listener_elems} FLUID221 "
-      f"element(s) attached")
-if n_listener_elems == 0:
-    raise RuntimeError(
-        f"listener node {listener_node} has no elements attached -- it "
-        "exists in the database but isn't actually part of the mesh.")
-mapdl.allsel()
-
-_lx = mapdl.get_value(entity="node", entnum=listener_node, item1="loc", it1num="x")
-_ly = mapdl.get_value(entity="node", entnum=listener_node, item1="loc", it1num="y")
-_lz = mapdl.get_value(entity="node", entnum=listener_node, item1="loc", it1num="z")
-print(f"[nodes] listener hard point KP={listener_kp} -> node {listener_node} at "
-      f"({_lx:.4f}, {_ly:.4f}, {_lz:.4f}) m")
+src_node, (_sx, _sy, _sz) = node_at_kp("source", src_kp)
+listener_node, (_lx, _ly, _lz) = node_at_kp("listener", listener_kp)
 
 # ==== WALL ABSORPTION ========================================================
 
 mapdl.allsel()
 if ALPHA_WALL > 0:
-    mapdl.asel("S", "LOC", "X", 0)
-    mapdl.asel("A", "LOC", "X", LX)
-    mapdl.asel("A", "LOC", "Y", 0)
-    mapdl.asel("A", "LOC", "Y", LY)
-    mapdl.asel("A", "LOC", "Z", 0)
-    mapdl.asel("A", "LOC", "Z", LZ)
-    n_wall_areas = int(mapdl.get_value(entity="area", entnum=0, item1="count"))
-    print(f"[abs] {n_wall_areas} exterior wall area(s) selected for "
-          f"absorption (alpha={ALPHA_WALL})")
-    if n_wall_areas == 0:
-        raise RuntimeError(
-            "no exterior wall areas found at the 6 bounding planes -- "
-            "wall absorption BC was not applied.")
-
-    mapdl.nsla("S", 1)   # include nodes shared with unselected areas/edges
-    n_wall_nodes = int(mapdl.get_value(entity="node", entnum=0, item1="count"))
+    mapdl.nsel("S", "EXT")                     
+    n_wall_nodes = int(mapdl.get_value("NODE", 0, "COUNT"))
+    if n_wall_nodes == 0:
+        raise RuntimeError("no exterior nodes found -- ATTN not applied")
     mapdl.sf("ALL", "ATTN", ALPHA_WALL)
-    print(f"[abs] absorption coefficient alpha={ALPHA_WALL} applied to "
-          f"{n_wall_nodes} wall node(s)")
-else:
-    print("[abs] ALPHA_WALL <= 0 -- walls left fully rigid "
-          "(no absorption BC applied)")
-
+    print(f"[abs] alpha={ALPHA_WALL} applied to {n_wall_nodes} wall node(s)")
 mapdl.allsel()
 
 # ==== BOUNDARY CONDITIONS ====================================================
 
 # Frequency dependent point mass source
 
-N_TABLE = 50
-table_freqs = np.linspace(FREQ_MIN, FREQ_MAX, N_TABLE)
+table_freqs = np.linspace(FREQ_MIN, FREQ_MAX, N_SUBSTEPS + 1)
+N_TABLE = len(table_freqs)
 table_values = SRC_MASS_MAGNITUDE / (2 * np.pi * table_freqs)
 
 SRC_TABLE = "src_mass_tab"
@@ -391,30 +318,28 @@ mapdl.bf(src_node, "MASS", f"%{SRC_TABLE}%", 0.0)
 print(f"[bc] source keypoint {src_kp} -> node {src_node} at "
       f"({SRC_X}, {SRC_Y}, {SRC_Z}) m, frequency-scaled mass source "
       f"(base {SRC_MASS_MAGNITUDE} kg/s at 1 Hz) applied")
- 
-print(mapdl.bflist(src_node, "all"))
- 
+  
 mapdl.allsel()
 
-mapdl.save(fname=JOBNAME, ext="db")
-mapdl.download(f"{JOBNAME}.db", target_dir=DIR_MODEL)
+mapdl.save(fname=JOBNAME, ext="db")    
 
 lap("boundary conditions")
 
 # ==== HARMONIC SOLVE =========================================================
 
 mapdl.run("/SOLU")
+mapdl.run("DDOPTION,FREQ,1") 
 mapdl.antype(3)
 mapdl.harfrq(freqb=FREQ_MIN, freqe=FREQ_MAX)
 mapdl.autots("off")
 mapdl.nsubst(N_SUBSTEPS)
-mapdl.kbc(0)
+mapdl.kbc(1)
 mapdl.outres("erase")
 mapdl.outres("all", "none")
 mapdl.outres("nsol", "all")
-mapdl.solve()
-mapdl.finish()
-mapdl.download(f"{JOBNAME}.rst", target_dir=DIR_MODEL)
+mapdl.outpr("ALL", "NONE")        
+mapdl.run("SOLVE", mute=True)
+mapdl.finish()                      
 lap("harmonic solve")
 
 mapdl.post1()
@@ -461,6 +386,12 @@ freqs = solved_freqs
 
 listener_pressure = pressure_sweep(listener_node, len(freqs))
 listener_spl = to_db(listener_pressure)
+
+np.savetxt(os.path.join(OUTPUT_DIR, "listener_sweep.csv"),
+           np.column_stack([freqs, listener_pressure.real,
+                            listener_pressure.imag, listener_spl]),
+           delimiter=",", fmt="%.10g",
+           header="freq_hz,p_re_pa,p_im_pa,spl_db", comments="")
 lap("pressure sweep")
 
 # ==== THEORETICAL MODES ======================================================
@@ -482,7 +413,7 @@ for lo, hi in zip(band_edges[:-1], band_edges[1:]):
 
 plot_freqs = sorted(plot_freqs)
 _plot_freqs_str = ", ".join(f"{f:.1f}" for f in plot_freqs)
-print(f"[sweep] modes selected for field plots (Hz, band-stratified, "
+print(f"[sweep] modes selected for plots (Hz), "
       f"{PLANES_PER_BAND}/band): [{_plot_freqs_str}]")
 
 # ==== LISTENER SPL PLOT ======================================================
@@ -578,7 +509,17 @@ lap("peak field plots")
 # ==== DONE ===================================================================
 mapdl.exit()
 lap("mapdl exit")
-shutil.rmtree(_mapdl_log_dir, ignore_errors=True)
-print(f"[cleanup] removed MAPDL scratch dir {_mapdl_log_dir}; "
-      f"kept {JOBNAME}.db and {JOBNAME}.rst in {DIR_MODEL}")
+
+KEEP = {f"{JOBNAME}.db", f"{JOBNAME}.rst"}
+KEEP_EXT = {".out", ".err", ".log"}
+_removed = 0
+for _f in glob.glob(os.path.join(_mapdl_run_dir, "*")):
+    _name = os.path.basename(_f)
+    if (os.path.isfile(_f) and _name not in KEEP
+            and os.path.splitext(_name)[1].lower() not in KEEP_EXT):
+        os.remove(_f)
+        _removed += 1
+print(f"[cleanup] removed {_removed} MAPDL scratch file(s); kept "
+      f"{JOBNAME}.db, {JOBNAME}.rst and MAPDL logs in {DIR_MODEL}")
+print(f"[done] results in {OUTPUT_DIR}")
 print(f"[timer] TOTAL: {time.perf_counter() - _T0:.2f} s")
